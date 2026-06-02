@@ -132,14 +132,6 @@ module Single_pipeline : sig
 
   val create : Lev_fiber.Thread.t -> t
 
-  val use
-    :  ?name:string
-    -> t
-    -> doc:Text_document.t
-    -> config:Merlin_config.t
-    -> f:(Mpipeline.t -> 'a)
-    -> ('a, Exn_with_backtrace.t) result Fiber.t
-
   val use_with_config
     :  ?name:string
     -> t
@@ -188,11 +180,6 @@ end = struct
       in
       let+ () = Metrics.report event in
       Ok res
-  ;;
-
-  let use ?name t ~doc ~config ~f =
-    let* config = Merlin_config.config config in
-    use_with_config ?name t ~doc ~config ~f
   ;;
 end
 

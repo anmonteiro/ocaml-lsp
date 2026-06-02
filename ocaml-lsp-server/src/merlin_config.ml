@@ -32,6 +32,8 @@ module Misc = Merlin_utils.Misc
 
 let empty = Mconfig_dot.empty_config
 
+let in_test () = Env_vars._TEST () |> Option.value ~default:false
+
 module Process = struct
   type nonrec t =
     { pid : Pid.t
@@ -56,7 +58,8 @@ module Process = struct
         | n -> Format.eprintf "%s finished with code = %d@.%!" t.prog n)
      | WSIGNALED s -> Format.eprintf "%s finished signal = %d@.%!" t.prog s
      | WSTOPPED _ -> ());
-    Format.eprintf "closed merlin process@.%s@." (Dyn.to_string @@ to_dyn t);
+    if not (in_test ())
+    then Format.eprintf "closed merlin process@.%s@." (Dyn.to_string @@ to_dyn t);
     Lev_fiber.Io.close t.stdin;
     Lev_fiber.Io.close t.stdout
   ;;
@@ -158,10 +161,12 @@ module Entry = struct
     then Fiber.return ()
     else (
       Table.remove t.db.running t.process.initial_cwd;
-      Format.eprintf
-        "halting %s merlin process@.%s@."
-        t.process.prog
-        (Dyn.to_string (Process.to_dyn t.process));
+      if not (in_test ())
+      then
+        Format.eprintf
+          "halting %s merlin process@.%s@."
+          t.process.prog
+          (Dyn.to_string (Process.to_dyn t.process));
       Dot_protocol_io.Commands.halt t.process.session)
   ;;
 end

@@ -92,6 +92,8 @@ let%expect_test "start/stop" =
             "diagnostic_promotions": true,
             "handleHoverExtended": true,
             "handleMerlinCallCompatible": true,
+            "handleMerlinConfigurations": true,
+            "handleSelectMerlinConfiguration": true,
             "handleTypeEnclosing": true,
             "handleGetDocumentation": true,
             "handleConstruct": true,

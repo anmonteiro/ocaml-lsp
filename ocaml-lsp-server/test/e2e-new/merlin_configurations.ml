@@ -7,9 +7,10 @@ module Merlin_call = Ocaml_lsp_server.Custom_request.Merlin_call_compatible
 let uri = DocumentUri.of_path "test.ml"
 let text_document = TextDocumentIdentifier.create ~uri
 
-let fake_ocaml_merlin_exe =
+let fake_ocaml_merlin_exe () =
   let cwd = Sys.getcwd () in
   [ "fake_ocaml_merlin/fake_ocaml_merlin.exe"
+  ; "_build/default/ocaml-lsp-server/test/e2e-new/fake_ocaml_merlin/fake_ocaml_merlin.exe"
   ; "ocaml-lsp/ocaml-lsp-server/test/e2e-new/fake_ocaml_merlin/fake_ocaml_merlin.exe"
   ; "_build/default/ocaml-lsp/ocaml-lsp-server/test/e2e-new/fake_ocaml_merlin/fake_ocaml_merlin.exe"
   ]
@@ -19,7 +20,7 @@ let fake_ocaml_merlin_exe =
 ;;
 
 let extra_env protocol =
-  [ "OCAMLLSP_PROJECT_BUILD_SYSTEM=" ^ fake_ocaml_merlin_exe
+  [ "OCAMLLSP_PROJECT_BUILD_SYSTEM=" ^ fake_ocaml_merlin_exe ()
   ; "OCAMLLSP_PROJECT_ROOT=" ^ Sys.getcwd ()
   ; "FAKE_OCAML_MERLIN_PROTOCOL=" ^ protocol
   ]
