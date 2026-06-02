@@ -30,6 +30,22 @@ let request client ~meth ~params =
   Client.request client (Lsp.Client_request.UnknownRequest { meth; params })
 ;;
 
+let print_response_or_error request =
+  let open Fiber.O in
+  let+ result =
+    Fiber.collect_errors (fun () ->
+      let+ response = request in
+      `Response response)
+  in
+  match result with
+  | Ok (`Response response) -> Test.print_result response
+  | Error [ { Exn_with_backtrace.exn = Jsonrpc.Response.Error.E error; _ } ] ->
+    Test.print_result (Jsonrpc.Response.Error.yojson_of_t error)
+  | Error errors ->
+    List.iter errors ~f:(fun error ->
+      Exn_with_backtrace.to_dyn error |> Dyn.to_string |> print_endline)
+;;
+
 let merlin_configurations client =
   let params =
     Configurations.Request_params.create ~text_document
@@ -92,6 +108,19 @@ let%expect_test "new protocol: list and select configurations" =
         "isActive": true
       }
     ]
+    |}]
+;;
+
+let%expect_test "new protocol: selecting unknown configuration fails" =
+  let request client = print_response_or_error (select_merlin_configuration client "js") in
+  Helpers.test ~extra_env:(extra_env "new") source request;
+  [%expect
+    {|
+    {
+      "data": { "id": "js" },
+      "code": -32602,
+      "message": "Unknown Merlin configuration \"js\""
+    }
     |}]
 ;;
 
