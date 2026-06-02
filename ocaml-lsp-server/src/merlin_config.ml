@@ -32,6 +32,8 @@ module Misc = Merlin_utils.Misc
 
 let empty = Mconfig_dot.empty_config
 
+let in_test () = Env_vars._TEST () |> Option.value ~default:false
+
 module Process = struct
   type nonrec t =
     { pid : Pid.t
@@ -56,7 +58,8 @@ module Process = struct
         | n -> Format.eprintf "%s finished with code = %d@.%!" t.prog n)
      | WSIGNALED s -> Format.eprintf "%s finished signal = %d@.%!" t.prog s
      | WSTOPPED _ -> ());
-    Format.eprintf "closed merlin process@.%s@." (Dyn.to_string @@ to_dyn t);
+    if not (in_test ())
+    then Format.eprintf "closed merlin process@.%s@." (Dyn.to_string @@ to_dyn t);
     Lev_fiber.Io.close t.stdin;
     Lev_fiber.Io.close t.stdout
   ;;
@@ -158,10 +161,12 @@ module Entry = struct
     then Fiber.return ()
     else (
       Table.remove t.db.running t.process.initial_cwd;
-      Format.eprintf
-        "halting %s merlin process@.%s@."
-        t.process.prog
-        (Dyn.to_string (Process.to_dyn t.process));
+      if not (in_test ())
+      then
+        Format.eprintf
+          "halting %s merlin process@.%s@."
+          t.process.prog
+          (Dyn.to_string (Process.to_dyn t.process));
       Dot_protocol_io.Commands.halt t.process.session)
   ;;
 end
@@ -232,6 +237,79 @@ let get_config (p : Process.t) ~workdir path_abs =
         p.prog
     in
     empty, [ suggest ]
+;;
+
+type configuration =
+  { id : string
+  ; mode : string option
+  ; is_default : bool
+  ; config : Mconfig.t
+  }
+
+let default_configuration config =
+  { id = "default"; mode = None; is_default = true; config }
+;;
+
+let select_default configurations =
+  List.find configurations ~f:(fun configuration -> configuration.is_default)
+  |> Option.value ~default:(List.hd_exn configurations)
+;;
+
+let get_configurations (p : Process.t) ~workdir path_abs =
+  let query_file_configurations path (p : Process.t) =
+    let* () = Dot_protocol_io.Commands.send_file_configurations p.session path in
+    Dot_protocol_io.read_configurations p.session
+  in
+  let query_file p =
+    let+ directives, failures = get_config p ~workdir path_abs in
+    [ ( { Merlin_dot_protocol.id = "default"
+        ; mode = None
+        ; is_default = true
+        ; directives = []
+        }
+      , (directives, failures) )
+    ]
+  in
+  let path_rel =
+    String.drop_prefix ~prefix:p.initial_cwd path_abs
+    |> Option.map ~f:(fun path ->
+      if String.length path > 0 && path.[0] = Filename.dir_sep.[0]
+      then String.drop path 1
+      else path)
+  in
+  let path = Option.value path_rel ~default:path_abs in
+  let+ answer =
+    let* answer = query_file_configurations path p in
+    match answer with
+    | Ok [] | Error (Merlin_dot_protocol.Unexpected_output _) -> query_file p
+    | Ok configurations ->
+      Fiber.return
+        (List.map configurations ~f:(fun configuration ->
+           let cfg, failures =
+             Mconfig_dot.prepend_config
+               ~dir:workdir
+               Mconfig_dot.Configurator.Dune
+               configuration.directives
+               empty
+           in
+           configuration, (Mconfig_dot.postprocess_config cfg, failures)))
+    | Error (Csexp_parse_error _) ->
+      let suggest =
+        Printf.sprintf
+          "ocamllsp could not load its configuration from the external reader. Building \
+           your project with `%s` might solve this issue."
+          p.prog
+      in
+      Fiber.return
+        [ ( { Merlin_dot_protocol.id = "default"
+            ; mode = None
+            ; is_default = true
+            ; directives = []
+            }
+          , (empty, [ suggest ]) )
+        ]
+  in
+  answer
 ;;
 
 let file_exists fname =
@@ -321,19 +399,19 @@ let create db path =
   { path; directory; initial; db; entry = None }
 ;;
 
-let config (t : t) : Mconfig.t Fiber.t =
+let configurations (t : t) : configuration list Fiber.t =
   let use_entry entry =
     Entry.incr entry;
     t.entry <- Some entry
   in
   let* () = Fiber.return () in
   if !prefer_dot_merlin
-  then Fiber.return (Mconfig.get_external_config t.path t.initial)
+  then Fiber.return [ default_configuration (Mconfig.get_external_config t.path t.initial) ]
   else (
     match find_project_context t.directory with
     | None ->
       let+ () = destroy t in
-      Mconfig.get_external_config t.path t.initial
+      [ default_configuration (Mconfig.get_external_config t.path t.initial) ]
     | Some (ctx, config_path) ->
       let* entry = get_process t.db ~dir:ctx.process_dir in
       let* () =
@@ -348,11 +426,23 @@ let config (t : t) : Mconfig.t Fiber.t =
             let+ () = destroy t in
             use_entry entry
       in
-      let+ dot, failures = get_config entry.process ~workdir:ctx.workdir t.path in
-      let merlin =
-        Mconfig.merge_merlin_config dot t.initial.merlin ~failures ~config_path
+      let+ configurations =
+        get_configurations entry.process ~workdir:ctx.workdir t.path
       in
-      Mconfig.normalize { t.initial with merlin })
+      List.map configurations ~f:(fun (configuration, (dot, failures)) ->
+        let merlin =
+          Mconfig.merge_merlin_config dot t.initial.merlin ~failures ~config_path
+        in
+        { id = configuration.id
+        ; mode = configuration.mode
+        ; is_default = configuration.is_default
+        ; config = Mconfig.normalize { t.initial with merlin }
+        }))
+;;
+
+let config (t : t) : Mconfig.t Fiber.t =
+  let+ configurations = configurations t in
+  (select_default configurations).config
 ;;
 
 module DB = struct

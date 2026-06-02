@@ -100,6 +100,12 @@ module Merlin : sig
 
   val kind : t -> Kind.t
   val to_doc : t -> doc
+  val configurations : t -> Merlin_config.configuration list Fiber.t
+  val configurations_with_active
+    :  t
+    -> (Merlin_config.configuration * bool) list Fiber.t
+
+  val set_active_configuration : t -> id:string -> (unit, string) result Fiber.t
   val mconfig : t -> Mconfig.t Fiber.t
 end
 

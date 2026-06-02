@@ -10,6 +10,7 @@
   (enabled_if
    (= %{os_type} Unix))
   (deps
+   %{exe:fake_ocaml_merlin/fake_ocaml_merlin.exe}
    %{bin:ocamlformat-rpc}
    for_ppx.ml
    for_pp.ml
@@ -73,6 +74,7 @@
     phrase
     type_expression
     locate
+    merlin_configurations
     type_search
     with_pp
     with_ppx

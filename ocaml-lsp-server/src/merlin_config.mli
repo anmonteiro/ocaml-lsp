@@ -4,7 +4,15 @@ open Import
 
 type t
 
+type configuration =
+  { id : string
+  ; mode : string option
+  ; is_default : bool
+  ; config : Mconfig.t
+  }
+
 val prefer_dot_merlin : bool ref
+val configurations : t -> configuration list Fiber.t
 val config : t -> Mconfig.t Fiber.t
 val destroy : t -> unit Fiber.t
 
