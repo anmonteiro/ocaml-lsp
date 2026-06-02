@@ -94,6 +94,8 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
               ; Dune.view_promotion_capability
               ; Req_hover_extended.capability
               ; Req_merlin_call_compatible.capability
+              ; Req_merlin_configurations.capability
+              ; Req_select_merlin_configuration.capability
               ; Req_type_enclosing.capability
               ; Req_get_documentation.capability
               ; Req_construct.capability
@@ -548,6 +550,8 @@ let on_request
          ; Req_typed_holes.meth, Req_typed_holes.on_request
          ; Req_jump_to_typed_hole.meth, Req_jump_to_typed_hole.on_request
          ; Req_merlin_call_compatible.meth, Req_merlin_call_compatible.on_request
+         ; Req_merlin_configurations.meth, Req_merlin_configurations.on_request
+         ; Req_select_merlin_configuration.meth, Req_select_merlin_configuration.on_request
          ; Req_type_enclosing.meth, Req_type_enclosing.on_request
          ; Req_get_documentation.meth, Req_get_documentation.on_request
          ; Req_merlin_jump.meth, Req_merlin_jump.on_request

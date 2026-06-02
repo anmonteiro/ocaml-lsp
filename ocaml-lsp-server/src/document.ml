@@ -201,6 +201,7 @@ type merlin =
   ; pipeline : Single_pipeline.t
   ; timer : Lev_fiber.Timer.Wheel.task
   ; merlin_config : Merlin_config.t
+  ; mutable active_config_id : string option
   ; syntax : Syntax.t
   ; kind : Kind.t option
   }
@@ -248,7 +249,9 @@ let make_merlin wheel merlin_db pipeline tdoc syntax =
     | Some _ as k -> k
     | None -> Kind.of_fname_opt path
   in
-  Fiber.return (Merlin { merlin_config; tdoc; pipeline; timer; syntax; kind })
+  Fiber.return
+    (Merlin
+       { merlin_config; tdoc; pipeline; timer; active_config_id = None; syntax; kind })
 ;;
 
 let make wheel config pipeline (doc : DidOpenTextDocumentParams.t) ~position_encoding =
@@ -289,6 +292,48 @@ module Merlin = struct
   let source t = Msource.make (text (Merlin t))
   let timer (t : t) = t.timer
 
+  let select_configuration configurations active_config_id =
+    match active_config_id with
+    | Some id ->
+      (match
+         List.find configurations ~f:(fun (configuration : Merlin_config.configuration) ->
+           String.equal configuration.id id)
+       with
+       | Some configuration -> configuration
+       | None ->
+         List.find configurations ~f:(fun configuration -> configuration.is_default)
+         |> Option.value ~default:(List.hd_exn configurations))
+    | None ->
+      List.find configurations ~f:(fun configuration -> configuration.is_default)
+      |> Option.value ~default:(List.hd_exn configurations)
+  ;;
+
+  let configurations (t : t) = Merlin_config.configurations t.merlin_config
+
+  let active_configuration (t : t) =
+    let+ configurations = configurations t in
+    select_configuration configurations t.active_config_id
+  ;;
+
+  let configurations_with_active (t : t) =
+    let+ configurations = configurations t in
+    let active = select_configuration configurations t.active_config_id in
+    List.map configurations ~f:(fun configuration ->
+      configuration, String.equal configuration.id active.id)
+  ;;
+
+  let set_active_configuration (t : t) ~id =
+    let+ configurations = configurations t in
+    match
+      List.find configurations ~f:(fun (configuration : Merlin_config.configuration) ->
+        String.equal configuration.id id)
+    with
+    | Some _ ->
+      t.active_config_id <- Some id;
+      Ok ()
+    | None -> Error (Printf.sprintf "Unknown Merlin configuration %S" id)
+  ;;
+
   let kind t =
     match t.kind with
     | Some k -> k
@@ -296,14 +341,18 @@ module Merlin = struct
   ;;
 
   let with_pipeline ?name (t : t) f =
-    Single_pipeline.use ?name t.pipeline ~doc:t.tdoc ~config:t.merlin_config ~f
+    let* configuration = active_configuration t in
+    Single_pipeline.use_with_config ?name t.pipeline ~doc:t.tdoc ~config:configuration.config ~f
   ;;
 
   let with_configurable_pipeline ?name ~config (t : t) f =
     Single_pipeline.use_with_config ?name t.pipeline ~doc:t.tdoc ~config ~f
   ;;
 
-  let mconfig (t : t) = Merlin_config.config t.merlin_config
+  let mconfig (t : t) =
+    let+ configuration = active_configuration t in
+    configuration.config
+  ;;
 
   let with_pipeline_exn ?name doc f =
     let+ res = with_pipeline ?name doc f in
