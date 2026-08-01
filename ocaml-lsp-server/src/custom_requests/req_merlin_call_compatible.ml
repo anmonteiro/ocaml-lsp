@@ -82,7 +82,7 @@ let t_of_yojson json =
 ;;
 
 let with_pipeline state uri specs raw_args cmd_args f =
-  Util.with_merlin state uri ~default:`Null (fun merlin ->
+  Util.with_primary_merlin state uri ~default:`Null (fun merlin ->
     let open Fiber.O in
     let* config = Document.Merlin.mconfig merlin in
     let specs = List.map ~f:snd specs in
