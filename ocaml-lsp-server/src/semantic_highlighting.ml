@@ -250,6 +250,7 @@ module Tokens : sig
     -> unit
 
   val yojson_of_t : t -> Yojson.Safe.t
+  val intersection : t list -> t
   val encode : t -> config -> int array
 end = struct
   type token =
@@ -319,6 +320,17 @@ end = struct
   ;;
 
   let yojson_of_t t = Json.Conv.yojson_of_list yojson_of_token (List.rev t.tokens)
+
+  let intersection = function
+    | [] -> create ()
+    | first :: rest ->
+      let tokens =
+        List.filter first.tokens ~f:(fun token ->
+          List.for_all rest ~f:(fun tokens ->
+            List.exists tokens.tokens ~f:(fun candidate -> Poly.equal token candidate)))
+      in
+      { tokens }
+  ;;
 
   let encode (t : t) (config : config) : int array =
     (* The parsetree traversal does not always visit nodes in source order. This
@@ -1045,16 +1057,62 @@ let gen_new_id =
     string_of_int x
 ;;
 
-let compute_tokens doc =
-  let+ parsetree, source =
-    Document.Merlin.with_pipeline_exn ~name:"semantic highlighting" doc (fun p ->
-      Mpipeline.reader_parsetree p, Mpipeline.input_source p)
-  in
+let compute_tokens_in_pipeline pipeline =
+  let parsetree = Mpipeline.reader_parsetree pipeline in
+  let source = Mpipeline.input_source pipeline in
   let module Fold = Parsetree_fold (struct
       let source = Msource.text source
     end)
   in
   Fold.apply parsetree
+;;
+
+let compute_primary_tokens doc =
+  let* { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn doc
+  in
+  let configuration = Merlin_config.primary configurations in
+  let doc =
+    Document.Merlin.to_doc doc
+    |> (fun doc -> Document.with_merlin_configuration doc configuration)
+    |> Document.merlin_exn
+  in
+  Document.Merlin.with_pipeline_exn ~name:"semantic highlighting" doc (fun pipeline ->
+    compute_tokens_in_pipeline pipeline)
+;;
+
+let compute_tokens doc =
+  let* { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn doc
+  in
+  let+ results =
+    Document.Merlin.with_configurations
+      ~name:"semantic highlighting"
+      doc
+      ~configurations
+      (fun _ pipeline -> compute_tokens_in_pipeline pipeline)
+  in
+  let results = Merlin_dot_protocol.Nonempty_list.to_list results in
+  let errors, tokens =
+    List.fold_left results ~init:([], []) ~f:(fun (errors, tokens) result ->
+      let { Document.Merlin.configuration; result } = result in
+      match result with
+      | Ok result -> errors, result :: tokens
+      | Error error -> (configuration, error) :: errors, tokens)
+  in
+  match errors with
+  | [] -> Tokens.intersection (List.rev tokens)
+  | errors ->
+    let modes =
+      List.rev_map errors ~f:(fun (configuration, _) ->
+        Merlin_config.configuration_label configuration)
+      |> String.concat ~sep:", "
+    in
+    Jsonrpc.Response.Error.raise
+      (Jsonrpc.Response.Error.make
+         ~code:RequestFailed
+         ~message:(sprintf "Semantic tokens failed for modes: %s" modes)
+         ())
 ;;
 
 let compute_encoded_tokens config doc =
@@ -1097,7 +1155,7 @@ module Debug = struct
                 ~message:"expected a merlin document"
                 ()
          | `Merlin merlin ->
-           let+ tokens = compute_tokens merlin in
+           let+ tokens = compute_primary_tokens merlin in
            Tokens.yojson_of_t tokens))
   ;;
 end
@@ -1214,14 +1272,17 @@ let on_request_full_delta
       let+ tokens = compute_encoded_tokens (client_config state) doc in
       let resultId = gen_new_id () in
       let cached_token_info =
-        Document_store.get_semantic_tokens_cache state.store params.textDocument.uri
+        Document_store.get_semantic_tokens_cache
+          state.store
+          params.textDocument.uri
+          ~resultId:params.previousResultId
       in
       Document_store.update_semantic_tokens_cache store uri ~resultId ~tokens;
       (match cached_token_info with
-       | Some cached_v when String.equal cached_v.resultId params.previousResultId ->
+       | Some cached_v ->
          let edits = find_diff ~old:cached_v.tokens ~new_:tokens in
          Some
            (`SemanticTokensDelta { SemanticTokensDelta.resultId = Some resultId; edits })
-       | Some _ | None ->
+       | None ->
          Some (`SemanticTokens { SemanticTokens.resultId = Some resultId; data = tokens })))
 ;;

@@ -24,7 +24,7 @@ let rec censor_backtraces = function
   | json -> json
 ;;
 
-let%expect_test "malformed object method leaks a destruct assertion" =
+let%expect_test "malformed object method does not offer destruct" =
   let source = "object method x with|0" in
   let range = range ~start_line:0 ~start_character:21 ~end_line:0 ~end_character:21 in
   let makeRequest textDocument =
@@ -37,17 +37,7 @@ let%expect_test "malformed object method leaks a destruct assertion" =
     | Error error ->
       Jsonrpc.Response.Error.yojson_of_t error |> censor_backtraces |> Test.print_result
     | Ok response -> print_code_action_result response);
-  [%expect
-    {|
-    {
-      "data": {
-        "exn": "Assert_failure(\"src/analysis/destruct.ml\", _, _)",
-        "backtrace": "<censored>"
-      },
-      "code": -32603,
-      "message": "uncaught exception"
-    }
-    |}]
+  [%expect {| No code actions |}]
 ;;
 
 let%expect_test "destruct-line rejects a cross-line recovery location" =

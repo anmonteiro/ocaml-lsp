@@ -396,7 +396,14 @@ end = struct
                        match Document.kind doc with
                        | `Other -> Fiber.return ()
                        | `Merlin merlin ->
-                         Diagnostics.merlin_diagnostics diagnostics merlin)
+                         let uri = Document.Merlin.to_doc merlin |> Document.uri in
+                         let generation =
+                           Diagnostics.begin_merlin_generation diagnostics uri
+                         in
+                         let+ (_ : bool) =
+                           Diagnostics.merlin_diagnostics diagnostics merlin ~generation
+                         in
+                         ())
                    in
                    Diagnostics.send diagnostics `All
                  | _ -> Fiber.return ())

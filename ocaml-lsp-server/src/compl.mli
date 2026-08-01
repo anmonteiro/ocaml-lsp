@@ -19,10 +19,10 @@ val complete
 
 (** creates a server response for ["completionItem/resolve"] *)
 val resolve
-  :  Document.Merlin.t
+  :  State.t
+  -> Document.Merlin.t
   -> CompletionItem.t
   -> Resolve.t
-  -> (Document.Merlin.t -> [> `Logical of int * int ] -> string option Fiber.t)
   -> markdown:bool
   -> CompletionItem.t Fiber.t
 

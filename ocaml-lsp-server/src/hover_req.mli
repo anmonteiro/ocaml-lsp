@@ -11,3 +11,7 @@ type mode =
 (** [handle server hover_params] provides a response for LSP request
     `textDocument/hover` *)
 val handle : State.t Server.t -> HoverParams.t -> mode -> Hover.t option Fiber.t
+
+(** Primary-configuration projection retained by the custom extended-hover
+    request. *)
+val handle_primary : State.t Server.t -> HoverParams.t -> mode -> Hover.t option Fiber.t

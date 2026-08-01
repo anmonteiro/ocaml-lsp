@@ -10,6 +10,7 @@
   (enabled_if
    (= %{os_type} Unix))
   (deps
+   %{exe:fake_ocaml_merlin/fake_ocaml_merlin.exe}
    %{bin:ocaml-index}
    %{bin:ocamlformat-rpc}
    %{bin:ocp-indent}
@@ -80,6 +81,7 @@
     infer_intf
     inlay_hints
     jump_to_typed_hole
+    merlin_configurations
     merlin_call_compatible
     destruct
     debug_echo

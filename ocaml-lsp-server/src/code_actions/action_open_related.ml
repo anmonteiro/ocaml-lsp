@@ -34,34 +34,40 @@ let available (capabilities : ShowDocumentClientCapabilities.t option) =
 
 let for_uri ~can_create_file (capabilities : ShowDocumentClientCapabilities.t option) doc =
   let uri = Document.uri doc in
-  let merlin_doc =
-    match Document.kind doc with
-    | `Merlin doc -> Some doc
-    | `Other -> None
-  in
   match available capabilities, Document.syntax doc with
-  | false, _ | true, (Dune | Cram) -> []
+  | false, _ | true, (Dune | Cram) -> Fiber.return []
   | true, (Ocaml | Reason | Ocamllex | Menhir | Mlx) ->
-    Document.get_impl_intf_counterparts merlin_doc uri
-    |> List.filter_map ~f:(fun uri ->
-      let path = Uri.to_path uri in
-      let exists = Sys.file_exists path in
-      if (not exists) && not can_create_file
-      then None
-      else (
-        let title =
-          sprintf "%s %s" (if exists then "Open" else "Create") (Filename.basename path)
+    let* counterparts =
+      match Document.kind doc with
+      | `Other -> Fiber.return (Document.get_impl_intf_counterparts None uri)
+      | `Merlin merlin ->
+        let+ { Document.Merlin.configurations; _ } =
+          Document.Merlin.configuration_context_exn merlin
         in
-        let command =
-          let arguments = [ DocumentUri.yojson_of_t uri ] in
-          Command.create ~title ~command:command_name ~arguments ()
-        in
-        let edit =
-          match exists with
-          | true -> None
-          | false ->
-            let documentChanges = [ `CreateFile (CreateFile.create ~uri ()) ] in
-            Some (WorkspaceEdit.create ~documentChanges ())
-        in
-        Some (CodeAction.create ?edit ~title ~kind ~command ())))
+        Document.get_impl_intf_counterparts_for_configurations merlin configurations uri
+    in
+    let actions =
+      List.filter_map counterparts ~f:(fun uri ->
+        let path = Uri.to_path uri in
+        let exists = Sys.file_exists path in
+        if (not exists) && not can_create_file
+        then None
+        else (
+          let title =
+            sprintf "%s %s" (if exists then "Open" else "Create") (Filename.basename path)
+          in
+          let command =
+            let arguments = [ DocumentUri.yojson_of_t uri ] in
+            Command.create ~title ~command:command_name ~arguments ()
+          in
+          let edit =
+            match exists with
+            | true -> None
+            | false ->
+              let documentChanges = [ `CreateFile (CreateFile.create ~uri ()) ] in
+              Some (WorkspaceEdit.create ~documentChanges ())
+          in
+          Some (CodeAction.create ?edit ~title ~kind ~command ())))
+    in
+    Fiber.return actions
 ;;

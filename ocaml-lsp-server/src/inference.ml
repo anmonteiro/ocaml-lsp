@@ -100,6 +100,90 @@ let open_document_from_file (state : State.t) uri =
       Some doc)
 ;;
 
+type counterpart =
+  { document : Document.t
+  ; temporary : bool
+  }
+
+let open_counterpart (state : State.t) initiating_doc initiating_merlin =
+  let initiating = Document.Merlin.fixed_configuration initiating_merlin in
+  let initiating_kind = Document.Merlin.kind initiating_merlin in
+  let counterpart_uri =
+    match initiating with
+    | Some { Merlin_config.origin = Plural { counterpart = Some uri; _ }; _ } ->
+      let uri = Source_path.uri uri in
+      Option.some_if (Sys.file_exists (Uri.to_path uri)) uri
+    | Some { origin = Plural { counterpart = None; _ }; _ } -> None
+    | Some { origin = Legacy_file; _ } | None ->
+      Document.get_impl_intf_counterparts
+        (Some initiating_merlin)
+        (Document.uri initiating_doc)
+      |> List.hd
+  in
+  match counterpart_uri with
+  | None -> Fiber.return None
+  | Some counterpart_uri ->
+    let* counterpart =
+      match Document_store.get_opt state.store counterpart_uri with
+      | Some document -> Fiber.return (Some { document; temporary = false })
+      | None ->
+        let+ document = open_document_from_file state counterpart_uri in
+        Option.map document ~f:(fun document -> { document; temporary = true })
+    in
+    (match counterpart with
+     | None -> Fiber.return None
+     | Some ({ document = counterpart_document; temporary } as counterpart) ->
+       (match Document.kind counterpart_document, initiating with
+        | `Other, _ ->
+          let+ () =
+            if temporary then Document.close counterpart_document else Fiber.return ()
+          in
+          None
+        | `Merlin _, None -> Fiber.return (Some counterpart)
+        | `Merlin counterpart_merlin, Some initiating ->
+          let* { Document.Merlin.configurations; kind = counterpart_kind } =
+            Document.Merlin.configuration_context_exn counterpart_merlin
+          in
+          let matching =
+            match initiating.origin with
+            | Legacy_file ->
+              let opposite =
+                match initiating_kind, counterpart_kind with
+                | Impl, Intf | Intf, Impl -> true
+                | Impl, Impl | Intf, Intf -> false
+              in
+              if opposite
+              then (
+                match Merlin_config.configuration_list configurations with
+                | [ configuration ] -> Some configuration
+                | [] | _ :: _ :: _ -> None)
+              else None
+            | Plural { mode; kind; _ } ->
+              Merlin_config.find_mode configurations mode
+              |> Option.bind ~f:(fun (configuration : Merlin_config.configuration) ->
+                match configuration.origin with
+                | Legacy_file -> None
+                | Plural { kind = counterpart_kind; _ } ->
+                  let opposite =
+                    match kind, counterpart_kind with
+                    | Implementation, Interface | Interface, Implementation -> true
+                    | Implementation, Implementation | Interface, Interface -> false
+                  in
+                  Option.some_if opposite configuration)
+          in
+          (match matching with
+           | Some configuration ->
+             let document =
+               Document.with_merlin_configuration counterpart_document configuration
+             in
+             Fiber.return (Some { counterpart with document })
+           | None ->
+             let+ () =
+               if temporary then Document.close counterpart_document else Fiber.return ()
+             in
+             None)))
+;;
+
 let infer_intf (state : State.t) intf_doc =
   match Document.kind intf_doc with
   | `Other -> invalid_arg "the provided document is not a merlin source."
@@ -107,20 +191,17 @@ let infer_intf (state : State.t) intf_doc =
     invalid_arg "the provided document is not an interface."
   | `Merlin m ->
     Fiber.of_thunk (fun () ->
-      let intf_uri = Document.uri intf_doc in
-      let impl_uri =
-        Document.get_impl_intf_counterparts (Some m) intf_uri |> List.hd_exn
-      in
-      let* impl_opt =
-        match Document_store.get_opt state.store impl_uri with
-        | Some impl -> Fiber.return (Some impl)
-        | None -> open_document_from_file state impl_uri
-      in
+      let* impl_opt = open_counterpart state intf_doc m in
       match impl_opt with
       | None -> Fiber.return None
-      | Some impl_doc ->
-        let+ res = infer_missing_intf_for_impl impl_doc intf_doc in
-        Some res)
+      | Some { document = impl_doc; temporary } ->
+        let run () =
+          let+ res = infer_missing_intf_for_impl impl_doc intf_doc in
+          Some res
+        in
+        if temporary
+        then Fiber.finalize run ~finally:(fun () -> Document.close impl_doc)
+        else run ())
 ;;
 
 (** Extracts an [Ident.t] from all variants that have one at the top level. For
@@ -238,40 +319,37 @@ let update_signatures
       ~(range : Range.t)
   =
   Fiber.of_thunk (fun () ->
-    let intf_uri = Document.uri doc in
-    let impl_uri =
-      Document.get_impl_intf_counterparts (Some intf_merlin) intf_uri |> List.hd_exn
-    in
-    let* impl_doc =
-      match Document_store.get_opt state.store impl_uri with
-      | Some impl -> Fiber.return (Some impl)
-      | None -> open_document_from_file state impl_uri
-    in
-    match impl_doc with
+    let* counterpart = open_counterpart state doc intf_merlin in
+    match counterpart with
     | None -> Fiber.return []
-    | Some impl_doc ->
-      let impl_merlin = Document.merlin_exn impl_doc in
-      (* CR-someday bwiedenbeck: These calls to Merlin to get the type information (and
-         the subsequent processing we do with it) are expensive on large documents.
-         This can cause problems if someone is trying to invoke some other code action,
-         because the LSP currently determines which CAs are possible by trying them all.
-         We've decided for now to allow slow code actions (especially since users are
-         less likely to be doing lots of little CAs in the mli file) and think more
-         about the broader CA protocol in the future. *)
-      let* typers = Fiber.parallel_map [ intf_merlin; impl_merlin ] ~f:get_typer in
-      let intf_typer = List.hd_exn typers in
-      let impl_typer = List.nth_exn typers 1 in
-      (match Mtyper.get_typedtree intf_typer with
-       | `Interface old_intf ->
-         let formatter sig_item =
-           let* config = Document.Merlin.mconfig intf_merlin in
-           let verbosity = config.query.verbosity in
-           let env = Mtyper.initial_env intf_typer in
-           Fiber.return
-             (Printtyp.wrap_printing_env ~verbosity env (fun () ->
-                Format.asprintf "%a@." Printtyp.signature [ sig_item ]))
-         in
-         let new_sigs = get_doc_signature impl_typer in
-         build_signature_edits ~old_intf ~new_sigs ~range ~formatter
-       | _ -> invalid_arg "expected an interface"))
+    | Some { document = impl_doc; temporary } ->
+      let run () =
+        let impl_merlin = Document.merlin_exn impl_doc in
+        (* CR-someday bwiedenbeck: These calls to Merlin to get the type information (and
+           the subsequent processing we do with it) are expensive on large documents.
+           This can cause problems if someone is trying to invoke some other code action,
+           because the LSP currently determines which CAs are possible by trying them all.
+           We've decided for now to allow slow code actions (especially since users are
+           less likely to be doing lots of little CAs in the mli file) and think more
+           about the broader CA protocol in the future. *)
+        let* typers = Fiber.parallel_map [ intf_merlin; impl_merlin ] ~f:get_typer in
+        let intf_typer = List.hd_exn typers in
+        let impl_typer = List.nth_exn typers 1 in
+        match Mtyper.get_typedtree intf_typer with
+        | `Interface old_intf ->
+          let formatter sig_item =
+            let* config = Document.Merlin.mconfig intf_merlin in
+            let verbosity = config.query.verbosity in
+            let env = Mtyper.initial_env intf_typer in
+            Fiber.return
+              (Printtyp.wrap_printing_env ~verbosity env (fun () ->
+                 Format.asprintf "%a@." Printtyp.signature [ sig_item ]))
+          in
+          let new_sigs = get_doc_signature impl_typer in
+          build_signature_edits ~old_intf ~new_sigs ~range ~formatter
+        | _ -> invalid_arg "expected an interface"
+      in
+      if temporary
+      then Fiber.finalize run ~finally:(fun () -> Document.close impl_doc)
+      else run ())
 ;;

@@ -93,6 +93,6 @@ let on_request ~params state =
       Request_params.t_of_yojson params
     in
     let uri = text_document.uri in
-    Util.with_impl_pipeline state uri ~default:`Null
+    Util.with_singleton_impl_pipeline state uri ~default:`Null
     @@ dispatch_construct position with_values depth)
 ;;

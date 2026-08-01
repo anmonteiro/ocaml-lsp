@@ -3,6 +3,57 @@ open Import
 let ocamllsp_source = "ocamllsp"
 let dune_source = "dune"
 
+let is_ocamllsp_source = function
+  | None -> false
+  | Some source ->
+    String.equal source ocamllsp_source
+    || String.is_prefix source ~prefix:(ocamllsp_source ^ " (")
+;;
+
+module Provenance = struct
+  type classification =
+    [ `External
+    | `Malformed
+    | `Modes of string list
+    ]
+
+  let data modes =
+    `Assoc
+      [ ( "ocamllsp"
+        , `Assoc
+            [ "version", `Int 1
+            ; "modes", `List (List.map modes ~f:(fun mode -> `String mode))
+            ] )
+      ]
+  ;;
+
+  let classify (diagnostic : Diagnostic.t) =
+    if not (is_ocamllsp_source diagnostic.source)
+    then `External
+    else (
+      match diagnostic.data with
+      | Some (`Assoc top) ->
+        (match List.Assoc.find top "ocamllsp" ~equal:String.equal with
+         | Some (`Assoc fields) ->
+           (match
+              ( List.Assoc.find fields "version" ~equal:String.equal
+              , List.Assoc.find fields "modes" ~equal:String.equal )
+            with
+            | Some (`Int 1), Some (`List modes) ->
+              let modes =
+                List.map modes ~f:(function
+                  | `String mode -> Some mode
+                  | _ -> None)
+              in
+              if List.for_all modes ~f:Option.is_some
+              then `Modes (List.filter_opt modes)
+              else `Malformed
+            | _ -> `Malformed)
+         | _ -> `Malformed)
+      | _ -> `Malformed)
+  ;;
+end
+
 module Id = struct
   include Drpc.Diagnostic.Id
 
@@ -77,6 +128,7 @@ let equal_message =
 type t =
   { dune : (Dune.t, (Drpc.Diagnostic.Id.t, Uri.t * Diagnostic.t) Hashtbl.t) Hashtbl.t
   ; merlin : (Uri.t, Diagnostic.t list) Hashtbl.t
+  ; merlin_generations : (Uri.t, int) Hashtbl.t
   ; send : PublishDiagnosticsParams.t list -> unit Fiber.t
   ; mutable dirty_uris : (Uri.t, Uri.comparator_witness) Set.t
   ; related_information : bool
@@ -99,6 +151,7 @@ let create
   in
   { dune = Hashtbl.create (module Dune)
   ; merlin = Hashtbl.create (module Uri)
+  ; merlin_generations = Hashtbl.create (module Uri)
   ; dirty_uris = Set.empty (module Uri)
   ; send
   ; related_information
@@ -106,6 +159,17 @@ let create
   ; report_dune_diagnostics
   ; shorten_merlin_diagnostics
   }
+;;
+
+let begin_merlin_generation t uri =
+  Hashtbl.update t.merlin_generations uri ~f:(function
+    | None -> 1
+    | Some generation -> generation + 1);
+  Hashtbl.find_exn t.merlin_generations uri
+;;
+
+let merlin_generation_is_current t uri generation =
+  Hashtbl.find t.merlin_generations uri |> Option.exists ~f:(Int.equal generation)
 ;;
 
 module Range_map = Stdlib.MoreLabels.Map.Make (struct
@@ -132,7 +196,7 @@ let add_dune_diagnostic diagnostics (diagnostic : Diagnostic.t) =
          if
            List.exists existing ~f:(fun (merlin : Diagnostic.t) ->
              match merlin.source with
-             | Some source when String.equal ocamllsp_source source ->
+             | Some source when is_ocamllsp_source (Some source) ->
                (match merlin.message, diagnostic.message with
                 | `String m1, `String m2 -> equal_message m1 m2
                 | `MarkupContent { kind; value }, `MarkupContent mc ->
@@ -226,7 +290,8 @@ let remove t = function
         t.dirty_uris <- Set.add t.dirty_uris uri))
   | `Merlin uri ->
     t.dirty_uris <- Set.add t.dirty_uris uri;
-    Hashtbl.remove t.merlin uri
+    Hashtbl.remove t.merlin uri;
+    Hashtbl.remove t.merlin_generations uri
 ;;
 
 let disconnect t dune =
@@ -329,7 +394,7 @@ let first_n_lines_of_range (range : Range.t) n =
 let error_to_diagnostics ~diagnostics ~merlin error =
   let doc = Document.Merlin.to_doc merlin in
   let create_diagnostic = Diagnostic.create ~source:ocamllsp_source in
-  let uri = Document.uri doc in
+  let uri = Document.uri doc |> Source_path.uri in
   let loc = Loc.loc_of_report error in
   let source = Document.Merlin.source merlin in
   let original_range = Range.of_loc loc |> clamp_range_to_source source in
@@ -386,58 +451,141 @@ let error_to_diagnostics ~diagnostics ~merlin error =
     ()
 ;;
 
-let compute_merlin_diagnostics diagnostics merlin =
+let canonicalize_diagnostic (diagnostic : Diagnostic.t) =
+  let relatedInformation =
+    Option.map diagnostic.relatedInformation ~f:(fun related ->
+      List.map related ~f:(fun (info : DiagnosticRelatedInformation.t) ->
+        { info with location = Source_path.location info.location }))
+  in
+  { diagnostic with relatedInformation; source = None; data = None }
+;;
+
+let merge_configured_diagnostics configurations configured =
+  let all_configurations = Merlin_config.configuration_list configurations in
+  let rec add configuration diagnostic = function
+    | [] -> [ canonicalize_diagnostic diagnostic, [ configuration ] ]
+    | (candidate, contributors) :: rest ->
+      let diagnostic = canonicalize_diagnostic diagnostic in
+      if Poly.equal candidate diagnostic
+      then (
+        let contributors =
+          if List.exists contributors ~f:(fun contributor -> contributor == configuration)
+          then contributors
+          else configuration :: contributors
+        in
+        (candidate, contributors) :: rest)
+      else (candidate, contributors) :: add configuration diagnostic rest
+  in
+  let groups, failures =
+    Merlin_dot_protocol.Nonempty_list.to_list configured
+    |> List.fold_left
+         ~init:([], [])
+         ~f:
+           (fun
+             (groups, failures)
+             ({ configuration; result } : _ Document.Merlin.configured_result)
+           ->
+           match result with
+           | Error error -> groups, (configuration, error) :: failures
+           | Ok diagnostics ->
+             ( List.fold_left diagnostics ~init:groups ~f:(fun groups diagnostic ->
+                 add configuration diagnostic groups)
+             , failures ))
+  in
+  List.iter failures ~f:(fun (configuration, error) ->
+    Log.log ~section:"merlin" (fun () ->
+      Log.msg
+        "Merlin diagnostics configuration failed"
+        [ "mode", `String (Merlin_config.configuration_label configuration)
+        ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+        ]));
+  List.map groups ~f:(fun (diagnostic, contributors) ->
+    let contributors =
+      List.filter all_configurations ~f:(fun configuration ->
+        List.exists contributors ~f:(fun contributor -> contributor == configuration))
+    in
+    let source =
+      if List.length contributors = List.length all_configurations
+      then Some ocamllsp_source
+      else
+        Some
+          (sprintf
+             "%s (%s)"
+             ocamllsp_source
+             (List.map contributors ~f:Merlin_config.configuration_label
+              |> String.concat ~sep:", "))
+    in
+    let modes =
+      List.filter_map contributors ~f:(fun configuration ->
+        Merlin_config.configuration_mode configuration
+        |> Option.map ~f:Merlin_config.mode_key)
+    in
+    let data = Option.some_if (not (List.is_empty modes)) (Provenance.data modes) in
+    { diagnostic with source; data })
+  |> List.sort ~compare:(fun (left : Diagnostic.t) right ->
+    Lsp.Range.compare left.range right.range)
+;;
+
+let merlin_diagnostics diagnostics merlin ~generation =
+  let doc = Document.Merlin.to_doc merlin in
+  let uri = Document.uri doc in
   let source = Document.Merlin.source merlin in
   let create_diagnostic = Diagnostic.create ~source:ocamllsp_source in
   let open Fiber.O in
-  let+ all_diagnostics =
+  let* context = Document.Merlin.configuration_context merlin in
+  match context with
+  | Error errors ->
+    Log.log ~section:"merlin" (fun () ->
+      Log.msg
+        "Merlin diagnostics configuration lookup failed"
+        [ "errors", `List (List.map errors ~f:(fun error -> `String error)) ]);
+    let current = merlin_generation_is_current diagnostics uri generation in
+    if current then set diagnostics (`Merlin (uri, []));
+    Fiber.return current
+  | Ok { configurations; _ } ->
     let command =
       Query_protocol.Errors { lexing = true; parsing = true; typing = true }
     in
-    Document.Merlin.with_pipeline_exn ~name:"diagnostics" merlin (fun pipeline ->
-      match Query_commands.dispatch pipeline command with
-      | exception Merlin_extend.Extend_main.Handshake.Error error ->
-        let message =
-          `String
-            (sprintf
-               "%s.\nHint: install the following packages: merlin-extend, reason"
-               error)
-        in
-        [ create_diagnostic ~range:Range.first_line ~message () ]
-      | errors ->
-        let merlin_diagnostics =
-          List.rev_map errors ~f:(error_to_diagnostics ~diagnostics ~merlin)
-        in
-        let holes_as_err_diags =
-          Query_commands.dispatch pipeline Holes
-          |> List.rev_map ~f:(fun (loc, typ) ->
-            let range = Range.of_loc loc |> clamp_range_to_source source in
-            let severity = DiagnosticSeverity.Error in
-            let message =
-              "This typed hole should be replaced with an expression of type " ^ typ
-            in
-            (* we set specific diagnostic code = "hole" to be able to
-               filter through diagnostics easily *)
-            create_diagnostic
-              ~code:(`String "hole")
-              ~range
-              ~message:(`String message)
-              ~severity
-              ())
-        in
-        (* Can we use [List.merge] instead? *)
-        List.rev_append holes_as_err_diags merlin_diagnostics
-        |> List.sort ~compare:(fun (d1 : Diagnostic.t) (d2 : Diagnostic.t) ->
-          Range.compare d1.range d2.range))
-  in
-  all_diagnostics
-;;
-
-let merlin_diagnostics diagnostics merlin =
-  let open Fiber.O in
-  let uri = Document.Merlin.to_doc merlin |> Document.uri in
-  let+ all_diagnostics = compute_merlin_diagnostics diagnostics merlin in
-  set diagnostics (`Merlin (uri, all_diagnostics))
+    let+ configured =
+      Document.Merlin.with_configurations
+        ~name:"diagnostics"
+        merlin
+        ~configurations
+        (fun _ pipeline ->
+           match Query_commands.dispatch pipeline command with
+           | exception Merlin_extend.Extend_main.Handshake.Error error ->
+             let message =
+               `String
+                 (sprintf
+                    "%s.\nHint: install the following packages: merlin-extend, reason"
+                    error)
+             in
+             [ create_diagnostic ~range:Lsp.Range.first_line ~message () ]
+           | errors ->
+             let merlin_diagnostics =
+               List.rev_map errors ~f:(error_to_diagnostics ~diagnostics ~merlin)
+             in
+             let holes_as_err_diags =
+               Query_commands.dispatch pipeline Holes
+               |> List.rev_map ~f:(fun (loc, typ) ->
+                 let range = Range.of_loc loc |> clamp_range_to_source source in
+                 let severity = DiagnosticSeverity.Error in
+                 let message =
+                   "This typed hole should be replaced with an expression of type " ^ typ
+                 in
+                 create_diagnostic
+                   ~code:(`String "hole")
+                   ~range
+                   ~message:(`String message)
+                   ~severity
+                   ())
+             in
+             List.rev_append holes_as_err_diags merlin_diagnostics)
+    in
+    let all_diagnostics = merge_configured_diagnostics configurations configured in
+    let current = merlin_generation_is_current diagnostics uri generation in
+    if current then set diagnostics (`Merlin (uri, all_diagnostics));
+    current
 ;;
 
 let set_report_dune_diagnostics t ~report_dune_diagnostics =

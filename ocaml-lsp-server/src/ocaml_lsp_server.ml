@@ -95,6 +95,7 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
               ; Dune.view_promotion_capability
               ; Req_hover_extended.capability
               ; Req_merlin_call_compatible.capability
+              ; Req_merlin_configurations.capability
               ; Req_type_enclosing.capability
               ; Req_get_documentation.capability
               ; Req_construct.capability
@@ -203,6 +204,7 @@ let set_diagnostics detached diagnostics doc =
   match Document.kind doc with
   | `Other -> Fiber.return ()
   | `Merlin merlin ->
+    let generation = Diagnostics.begin_merlin_generation diagnostics uri in
     let async send =
       let+ () =
         task_if_running detached ~f:(fun () ->
@@ -234,8 +236,8 @@ let set_diagnostics detached diagnostics doc =
        async (fun () -> Diagnostics.send diagnostics (`One uri))
      | Reason | Ocaml | Mlx ->
        async (fun () ->
-         let* () = Diagnostics.merlin_diagnostics diagnostics merlin in
-         Diagnostics.send diagnostics (`One uri)))
+         let* current = Diagnostics.merlin_diagnostics diagnostics merlin ~generation in
+         if current then Diagnostics.send diagnostics (`One uri) else Fiber.return ()))
 ;;
 
 let register_dune_and_cram_text_document_sync server (capabilities : ClientCapabilities.t)
@@ -422,27 +424,103 @@ let text_document_lens
   let doc = Document_store.get store uri in
   match Document.kind doc with
   | `Other -> Fiber.return []
-  | `Merlin m when Document.Merlin.kind m = Intf -> Fiber.return []
   | `Merlin doc ->
-    let+ outline = Document.Merlin.dispatch_exn ~name:"outline" doc Outline in
-    let rec symbol_info_of_outline_item (item : Query_protocol.item) =
-      let children =
-        if for_nested_bindings
-        then List.concat_map item.children ~f:symbol_info_of_outline_item
-        else []
-      in
-      match item.outline_type with
-      | None -> children
-      | Some typ ->
-        let loc = item.location in
-        let info =
-          let range = Range.of_loc loc in
-          let command = Command.create ~title:typ ~command:"" () in
-          CodeLens.create ~range ~command ()
-        in
-        info :: children
+    let* { Document.Merlin.configurations; kind } =
+      Document.Merlin.configuration_context_exn doc
     in
-    List.concat_map ~f:symbol_info_of_outline_item outline
+    if kind = Intf
+    then Fiber.return []
+    else
+      let+ configured =
+        Document.Merlin.dispatch_all ~name:"outline" doc ~configurations Outline
+      in
+      let rec symbol_info_of_outline_item (item : Query_protocol.item) =
+        let children =
+          if for_nested_bindings
+          then List.concat_map item.children ~f:symbol_info_of_outline_item
+          else []
+        in
+        match item.outline_type with
+        | None -> children
+        | Some typ ->
+          let loc = item.location in
+          let info =
+            let range = Range.of_loc loc in
+            let command = Command.create ~title:typ ~command:"" () in
+            CodeLens.create ~range ~command ()
+          in
+          info :: children
+      in
+      let lenses, failures, successes =
+        Merlin_dot_protocol.Nonempty_list.to_list configured
+        |> List.fold_left
+             ~init:([], [], 0)
+             ~f:
+               (fun
+                 (lenses, failures, successes)
+                 ({ configuration; result } : _ Document.Merlin.configured_result)
+               ->
+               match result with
+               | Error error -> lenses, (configuration, error) :: failures, successes
+               | Ok outline ->
+                 let found = List.concat_map ~f:symbol_info_of_outline_item outline in
+                 ( List.rev_append
+                     (List.map found ~f:(fun lens -> configuration, lens))
+                     lenses
+                 , failures
+                 , successes + 1 ))
+      in
+      List.iter failures ~f:(fun (configuration, error) ->
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            "Merlin code lens configuration failed"
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]));
+      if successes = 0
+      then (
+        let primary = Merlin_config.primary configurations in
+        match
+          List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        with
+        | Some (_, error) -> Exn_with_backtrace.reraise error
+        | None -> invalid_arg "configured code lens query had no result");
+      let rec add_lens configuration lens = function
+        | [] -> [ lens, [ configuration ] ]
+        | (candidate, contributors) :: rest ->
+          if Poly.equal lens candidate
+          then (
+            let contributors =
+              if
+                List.exists contributors ~f:(fun contributor ->
+                  contributor == configuration)
+              then contributors
+              else configuration :: contributors
+            in
+            (candidate, contributors) :: rest)
+          else (candidate, contributors) :: add_lens configuration lens rest
+      in
+      let groups =
+        List.fold_left (List.rev lenses) ~init:[] ~f:(fun groups (configuration, lens) ->
+          add_lens configuration lens groups)
+      in
+      let all_configurations = Merlin_config.configuration_list configurations in
+      List.map groups ~f:(fun (lens, contributors) ->
+        if List.length contributors = List.length all_configurations
+        then lens
+        else (
+          let labels =
+            List.filter all_configurations ~f:(fun configuration ->
+              List.exists contributors ~f:(fun contributor ->
+                contributor == configuration))
+            |> List.map ~f:Merlin_config.configuration_label
+            |> String.concat ~sep:", "
+          in
+          let command =
+            Option.map lens.CodeLens.command ~f:(fun command ->
+              { command with title = command.title ^ " (" ^ labels ^ ")" })
+          in
+          { lens with command }))
 ;;
 
 let selection_range
@@ -453,16 +531,19 @@ let selection_range
   match Document.kind doc with
   | `Other -> Fiber.return []
   | `Merlin merlin ->
-    let selection_range_of_enclosings position (enclosings : Warnings.loc list)
-      : SelectionRange.t
-      =
-      (* TODO: Convert selection-range inputs and outputs using the negotiated
-         position encoding instead of Merlin's UTF-8 byte columns. *)
-      let source = Document.Merlin.source merlin in
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
+    (* TODO: Convert selection-range inputs and outputs using the negotiated
+       position encoding instead of Merlin's UTF-8 byte columns. *)
+    let source = Document.Merlin.source merlin in
+    let ranges_for_position position enclosings =
       List.filter_map enclosings ~f:(fun enclosing ->
         let range = Range.clamp_to_source (Range.of_loc enclosing) source in
         Option.some_if (Range.contains_position range position ~inclusive_end:true) range)
-      |> List.rev
+    in
+    let selection_range_of_ranges position ranges =
+      List.rev ranges
       |> List.fold_left ~init:None ~f:(fun parent range ->
         Some { SelectionRange.range; parent })
       |> Option.value
@@ -471,12 +552,61 @@ let selection_range
              ; parent = None
              }
     in
-    Fiber.sequential_map positions ~f:(fun pos ->
-      Document.Merlin.dispatch_exn
+    let+ configured =
+      Document.Merlin.with_configurations
         ~name:"shape"
         merlin
-        (Enclosing (Position.logical pos, None))
-      >>| selection_range_of_enclosings pos)
+        ~configurations
+        (fun _ pipeline ->
+           List.map positions ~f:(fun position ->
+             Query_commands.dispatch
+               pipeline
+               (Enclosing (Position.logical position, None))))
+    in
+    let failures =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.filter_map
+           ~f:(fun ({ configuration; result } : _ Document.Merlin.configured_result) ->
+             Result.error result |> Option.map ~f:(fun error -> configuration, error))
+    in
+    if not (List.is_empty failures)
+    then (
+      List.iter failures ~f:(fun (configuration, error) ->
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            "Merlin selection range configuration failed"
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]));
+      let modes =
+        List.map failures ~f:(fun (configuration, _) ->
+          Merlin_config.configuration_label configuration)
+        |> String.concat ~sep:", "
+      in
+      Jsonrpc.Response.Error.raise
+        (Jsonrpc.Response.Error.make
+           ~code:RequestFailed
+           ~message:("Selection range failed for configurations: " ^ modes)
+           ()));
+    let all_enclosings =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.map ~f:(fun ({ result; _ } : _ Document.Merlin.configured_result) ->
+        match result with
+        | Ok value -> value
+        | Error _ -> invalid_arg "failed selection range survived validation")
+    in
+    List.mapi positions ~f:(fun index position ->
+      let chains =
+        List.map all_enclosings ~f:(fun per_position ->
+          List.nth_exn per_position index |> ranges_for_position position)
+      in
+      let primary_chain = List.hd_exn chains in
+      let common =
+        List.filter primary_chain ~f:(fun range ->
+          List.for_all (List.tl_exn chains) ~f:(fun chain ->
+            List.exists chain ~f:(Poly.equal range)))
+      in
+      selection_range_of_ranges position common)
 ;;
 
 let references
@@ -488,72 +618,157 @@ let references
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin doc ->
-    let* occurrences, synced =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn doc
+    in
+    let* configured =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         doc
+        ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Project))
     in
-    let* declaration =
+    let locations, out_of_sync, failures, successes =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.fold_left
+           ~init:([], [], [], 0)
+           ~f:
+             (fun
+               (locations, out_of_sync, failures, successes)
+               ({ configuration; result } : _ Document.Merlin.configured_result)
+             ->
+             match result with
+             | Error error ->
+               locations, out_of_sync, (configuration, error) :: failures, successes
+             | Ok (occurrences, synced) ->
+               let out_of_sync =
+                 match synced with
+                 | `Out_of_sync _ -> configuration :: out_of_sync
+                 | _ -> out_of_sync
+               in
+               let found =
+                 List.filter_map
+                   occurrences
+                   ~f:(fun ({ loc; is_stale } : Query_protocol.occurrence) ->
+                     if is_stale
+                     then None
+                     else (
+                       let range = Range.of_loc loc in
+                       let target_uri =
+                         match loc.loc_start.pos_fname with
+                         | "" -> uri
+                         | path -> Source_path.of_path path
+                       in
+                       Some (Source_path.location { Location.uri = target_uri; range })))
+               in
+               List.rev_append found locations, out_of_sync, failures, successes + 1)
+    in
+    List.iter failures ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          "Merlin occurrences configuration failed"
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    if successes = 0
+    then (
+      let primary = Merlin_config.primary configurations in
+      let _, error =
+        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        |> Option.value ~default:(List.hd_exn failures)
+      in
+      Exn_with_backtrace.reraise error);
+    let* declarations =
       if context.includeDeclaration
-      then Fiber.return None
-      else
-        Document.Merlin.dispatch_exn
-          ~name:"reference-declaration"
-          doc
-          (Locate (None, `ML, Position.logical position))
-        >>| function
-        | `At_origin -> Some (`At_origin (uri, position))
-        | `Found (path, lexical_position) ->
-          Position.of_lexical_position lexical_position
-          |> Option.map ~f:(fun position ->
-            `Found (Option.value_map path ~default:uri ~f:Uri.of_path, position))
-        | `Builtin _ | `File_not_found _ | `Invalid_context | `Not_found _ | `Not_in_env _
-          -> None
+      then Fiber.return []
+      else (
+        let* configured =
+          Document.Merlin.dispatch_all
+            ~name:"reference-declaration"
+            doc
+            ~configurations
+            (Locate (None, `ML, Position.logical position))
+        in
+        let declarations, failures, successes =
+          Merlin_dot_protocol.Nonempty_list.to_list configured
+          |> List.fold_left
+               ~init:([], [], 0)
+               ~f:
+                 (fun
+                   (declarations, failures, successes)
+                   ({ configuration; result } : _ Document.Merlin.configured_result)
+                 ->
+                 match result with
+                 | Error error ->
+                   declarations, (configuration, error) :: failures, successes
+                 | Ok result ->
+                   let declaration =
+                     match result with
+                     | `At_origin -> Some (`At_origin (Source_path.uri uri, position))
+                     | `Found (path, lexical_position) ->
+                       Position.of_lexical_position lexical_position
+                       |> Option.map ~f:(fun position ->
+                         let uri =
+                           Option.value_map
+                             path
+                             ~default:(Source_path.uri uri)
+                             ~f:Source_path.of_path
+                         in
+                         `Found (uri, position))
+                     | `Builtin _
+                     | `File_not_found _
+                     | `Invalid_context
+                     | `Not_found _
+                     | `Not_in_env _ -> None
+                   in
+                   Option.to_list declaration @ declarations, failures, successes + 1)
+        in
+        List.iter failures ~f:(fun (configuration, error) ->
+          Log.log ~section:"merlin" (fun () ->
+            Log.msg
+              "Merlin reference declaration configuration failed"
+              [ "mode", `String (Merlin_config.configuration_label configuration)
+              ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+              ]));
+        if successes = 0
+        then (
+          let primary = Merlin_config.primary configurations in
+          let _, error =
+            List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+            |> Option.value ~default:(List.hd_exn failures)
+          in
+          Exn_with_backtrace.reraise error);
+        Fiber.return declarations)
     in
     let+ () =
-      match synced with
-      | `Out_of_sync _ ->
+      match out_of_sync with
+      | _ :: _ ->
         let msg =
           let message =
             "The index might be out-of-sync.  If you use Dune you can build the target \
-             `@ocaml-index` to refresh the index."
+             `@ocaml-index` to refresh the index. Affected configurations: "
+            ^ String.concat
+                ~sep:", "
+                (List.rev_map out_of_sync ~f:Merlin_config.configuration_label)
           in
           ShowMessageParams.create ~message ~type_:Warning
         in
         task_if_running state.detached ~f:(fun () ->
           Server.notification rpc (ShowMessage msg))
-      | _ -> Fiber.return ()
+      | [] -> Fiber.return ()
     in
-    Some
-      (List.filter_map occurrences ~f:(function
-         | { loc = _; is_stale = true } -> None
-         | { loc; is_stale = false } ->
-           let range = Range.of_loc loc in
-           let occurrence_uri =
-             match loc.loc_start.pos_fname with
-             | "" -> uri
-             | path -> Uri.of_path path
-           in
-           let is_declaration =
-             Option.value_map declaration ~default:false ~f:(function
-               | `At_origin (declaration_uri, position) ->
-                 Uri.equal occurrence_uri declaration_uri
-                 && Range.contains_position range position ~inclusive_end:true
-               | `Found (declaration_uri, position) ->
-                 Uri.equal occurrence_uri declaration_uri
-                 && Position.compare range.start position = 0)
-           in
-           if is_declaration
-           then None
-           else (
-             Log.log ~section:"debug" (fun () ->
-               Log.msg
-                 "merlin returned fname %a"
-                 [ "pos_fname", `String loc.loc_start.pos_fname
-                 ; "uri", `String (Uri.to_string occurrence_uri)
-                 ]);
-             Some { Location.uri = occurrence_uri; range })))
+    let is_declaration ({ Location.uri; range } : Location.t) =
+      List.exists declarations ~f:(function
+        | `At_origin (declaration_uri, position) ->
+          Uri.equal uri declaration_uri
+          && Range.contains_position range position ~inclusive_end:true
+        | `Found (declaration_uri, position) ->
+          Uri.equal uri declaration_uri && Position.compare range.start position = 0)
+    in
+    List.rev locations
+    |> List.filter ~f:(Fn.non is_declaration)
+    |> Source_path.deduplicate_locations
+    |> Option.some
 ;;
 
 let highlight
@@ -565,26 +780,60 @@ let highlight
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin m ->
-    let+ occurrences, _synced =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn m
+    in
+    let+ configured =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         m
+        ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Buffer))
     in
-    let lsp_locs =
-      List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-        let loc = occurrence.loc in
-        let range = Range.of_loc loc in
-        (* filter out multi-line ranges, since those are very noisy and happen
-           a lot with certain PPXs *)
-        match Range.is_single_line range with
-        | true ->
-          (* using the default kind as we are lacking info to make a
-             difference between assignment and usage. *)
-          Some (DocumentHighlight.create ~range ~kind:DocumentHighlightKind.Text ())
-        | false -> None)
+    let lsp_locs, failures, successes =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.fold_left
+           ~init:([], [], 0)
+           ~f:
+             (fun
+               (locations, failures, successes)
+               ({ configuration; result } : _ Document.Merlin.configured_result)
+             ->
+             match result with
+             | Error error -> locations, (configuration, error) :: failures, successes
+             | Ok (occurrences, _synced) ->
+               let found =
+                 List.filter_map
+                   occurrences
+                   ~f:(fun (occurrence : Query_protocol.occurrence) ->
+                     let range = Range.of_loc occurrence.loc in
+                     if Lsp.Range.is_single_line range
+                     then
+                       Some
+                         (DocumentHighlight.create
+                            ~range
+                            ~kind:DocumentHighlightKind.Text
+                            ())
+                     else None)
+               in
+               List.rev_append found locations, failures, successes + 1)
     in
-    Some lsp_locs
+    List.iter failures ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          "Merlin highlight configuration failed"
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    if successes = 0
+    then (
+      let primary = Merlin_config.primary configurations in
+      let _, error =
+        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        |> Option.value ~default:(List.hd_exn failures)
+      in
+      Exn_with_backtrace.reraise error);
+    Some (List.dedup_and_sort ~compare:Poly.compare lsp_locs)
 ;;
 
 let document_symbol (state : State.t) uri =
@@ -616,14 +865,12 @@ let on_request
   | Client_request.UnknownRequest { meth; params } ->
     (match
        List.Assoc.find
-         [ ( Req_switch_impl_intf.meth
-           , fun ~params state ->
-               Fiber.of_thunk (fun () ->
-                 Fiber.return (Req_switch_impl_intf.on_request ~params state)) )
+         [ Req_switch_impl_intf.meth, Req_switch_impl_intf.on_request
          ; Req_infer_intf.meth, Req_infer_intf.on_request
          ; Req_typed_holes.meth, Req_typed_holes.on_request
          ; Req_jump_to_typed_hole.meth, Req_jump_to_typed_hole.on_request
          ; Req_merlin_call_compatible.meth, Req_merlin_call_compatible.on_request
+         ; Req_merlin_configurations.meth, Req_merlin_configurations.on_request
          ; Req_type_enclosing.meth, Req_type_enclosing.on_request
          ; Req_get_documentation.meth, Req_get_documentation.on_request
          ; Req_merlin_jump.meth, Req_merlin_jump.on_request
@@ -723,13 +970,7 @@ let on_request
            in
            (match Document.kind doc with
             | `Other -> Fiber.return ci
-            | `Merlin doc ->
-              Compl.resolve
-                doc
-                ci
-                resolve
-                (Document.Merlin.doc_comment ~name:"completion-resolve")
-                ~markdown))
+            | `Merlin doc -> Compl.resolve state doc ci resolve ~markdown))
       ()
   | CodeAction params -> Code_actions.compute server params
   | InlayHint params -> later (fun state () -> Inlay_hints.compute state params) ()
@@ -899,7 +1140,12 @@ let on_notification server (notification : Client_notification.t) : State.t Fibe
             | `Merlin _, Reason when Option.is_none (Bin.which ocamlmerlin_reason) ->
               Fiber.return ()
             | `Merlin merlin, (Reason | Ocaml | Mlx) ->
-              Diagnostics.merlin_diagnostics diagnostics merlin
+              let uri = Document.Merlin.to_doc merlin |> Document.uri in
+              let generation = Diagnostics.begin_merlin_generation diagnostics uri in
+              let+ (_ : bool) =
+                Diagnostics.merlin_diagnostics diagnostics merlin ~generation
+              in
+              ()
             | `Merlin _, (Dune | Cram | Menhir | Ocamllex) -> assert false)
         in
         Diagnostics.send diagnostics `All

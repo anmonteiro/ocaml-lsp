@@ -1,12 +1,50 @@
 open Import
 open Fiber.O
 
-module Resolve = struct
-  type t = CompletionParams.t
+let completion_identity (item : CompletionItem.t) =
+  { item with
+    commitCharacters = None
+  ; data = None
+  ; deprecated = None
+  ; detail = None
+  ; documentation = None
+  ; filterText = None
+  ; labelDetails = None
+  ; preselect = None
+  ; sortText = None
+  ; tags = None
+  }
+;;
 
-  let uri (t : t) = t.textDocument.uri
-  let yojson_of_t = CompletionParams.yojson_of_t
-  let t_of_yojson = CompletionParams.t_of_yojson
+module Resolve = struct
+  type t =
+    { params : CompletionParams.t
+    ; version : int option
+    ; identity : CompletionItem.t option
+    }
+
+  let uri t = t.params.textDocument.uri
+
+  let yojson_of_t { params; version; identity } =
+    `Assoc
+      [ "params", CompletionParams.yojson_of_t params
+      ; "version", `Int (Option.value_exn version)
+      ; "identity", CompletionItem.yojson_of_t (Option.value_exn identity)
+      ]
+  ;;
+
+  let t_of_yojson json =
+    let open Yojson.Safe.Util in
+    match member "params" json with
+    | `Null ->
+      { params = CompletionParams.t_of_yojson json; version = None; identity = None }
+    | params ->
+      { params = CompletionParams.t_of_yojson params
+      ; version = Some (member "version" json |> to_int)
+      ; identity = Some (member "identity" json |> CompletionItem.t_of_yojson)
+      }
+  ;;
+
   let of_completion_item (ci : CompletionItem.t) = Option.map ci.data ~f:t_of_yojson
 end
 
@@ -141,7 +179,6 @@ module Complete_by_prefix = struct
   let completionItem_of_completion_entry
         idx
         (entry : Query_protocol.Compl.entry)
-        ~compl_params
         ~range
         ~supports_deprecated_field
         ~supports_deprecated_tag
@@ -166,7 +203,6 @@ module Complete_by_prefix = struct
         (* Without this field the client is not forced to respect the order
            provided by merlin. *)
       ~sortText:(sortText_of_index ~width:sort_text_width idx)
-      ?data:compl_params
       ~textEdit
       ()
   ;;
@@ -180,7 +216,6 @@ module Complete_by_prefix = struct
         ~supports_deprecated_field
         ~supports_deprecated_tag
         ~supports_enum_member
-        ~resolve
         ~prefix
         doc
         pos
@@ -205,21 +240,6 @@ module Complete_by_prefix = struct
           ; deprecated = false (* TODO this is wrong *)
           })
     in
-    (* we need to json-ify completion params to put them in completion item's
-       [data] field to keep it across [textDocument/completion] and the
-       following [completionItem/resolve] requests *)
-    let compl_params =
-      match resolve with
-      | false -> None
-      | true ->
-        Some
-          (let textDocument =
-             TextDocumentIdentifier.create
-               ~uri:(Document.uri (Document.Merlin.to_doc doc))
-           in
-           CompletionParams.create ~textDocument ~position:pos ()
-           |> CompletionParams.yojson_of_t)
-    in
     let sort_text_width = sortText_width (List.length completion_entries) in
     List.mapi
       completion_entries
@@ -229,7 +249,6 @@ module Complete_by_prefix = struct
            ~supports_deprecated_tag
            ~supports_enum_member
            ~range
-           ~compl_params
            ~sort_text_width)
   ;;
 
@@ -249,41 +268,6 @@ module Complete_by_prefix = struct
       in
       [ ci_for_in ]
     | _ -> []
-  ;;
-
-  let complete
-        doc
-        prefix
-        pos
-        ~supports_deprecated_field
-        ~supports_deprecated_tag
-        ~supports_enum_member
-        ~resolve
-    =
-    let+ (completion : Query_protocol.completions) =
-      let logical_pos = Position.logical pos in
-      Document.Merlin.with_pipeline_exn
-        ~name:"completion-prefix"
-        doc
-        (dispatch_cmd ~prefix logical_pos)
-    in
-    let keyword_completionItems =
-      (* we complete only keyword 'in' for now *)
-      match Document.Merlin.kind doc with
-      | Intf -> []
-      | Impl -> complete_keywords pos prefix
-    in
-    keyword_completionItems
-    @ process_dispatch_resp
-        ~supports_deprecated_field
-        ~supports_deprecated_tag
-        ~supports_enum_member
-        ~resolve
-        ~prefix
-        doc
-        pos
-        completion
-    |> reindex_sortText
   ;;
 end
 
@@ -348,128 +332,271 @@ module Complete_with_construct = struct
   ;;
 end
 
-let complete
-      (state : State.t)
-      ({ textDocument = { uri }; position = pos; context; _ } : CompletionParams.t)
+type completion_capabilities =
+  { resolve : bool
+  ; supports_deprecated_field : bool
+  ; supports_deprecated_tag : bool
+  ; supports_enum_member : bool
+  ; supports_preselect : bool
+  }
+
+let completion_capabilities (state : State.t) =
+  let capabilities = State.client_capabilities state in
+  let resolve =
+    match Capabilities.completion_resolve_properties capabilities with
+    | None -> false
+    | Some properties -> List.mem properties "documentation" ~equal:String.equal
+  in
+  let supports_deprecated_tag =
+    match Capabilities.completion_tag_support capabilities with
+    | None -> false
+    | Some value_set ->
+      Deprecation.tag_supported
+        value_set
+        ~tag:CompletionItemTag.Deprecated
+        ~equal:(fun CompletionItemTag.Deprecated Deprecated -> true)
+  in
+  let supports_deprecated_field =
+    (not supports_deprecated_tag)
+    && Capabilities.completion_deprecated_support capabilities
+  in
+  let supports_enum_member =
+    Option.value_map
+      (Capabilities.completion_item_kind_support capabilities)
+      ~default:false
+      ~f:(fun value_set ->
+        Capabilities.supported
+          value_set
+          ~tag:CompletionItemKind.EnumMember
+          ~equal:Poly.equal)
+  in
+  let supports_preselect = Capabilities.completion_preselect_support capabilities in
+  { resolve
+  ; supports_deprecated_field
+  ; supports_deprecated_tag
+  ; supports_enum_member
+  ; supports_preselect
+  }
+;;
+
+type configured_completion =
+  | Suppressed
+  | Items of CompletionItem.t list
+
+let run_completion_pass
+      state
+      merlin
+      capabilities
+      ~check_comments
+      ~absolute_position
+      ~position
+      ~lsp_position
+      ~prefix
+      ~is_hole
+      pipeline
   =
+  let inside_comment =
+    check_comments
+    && Mpipeline.reader_comments pipeline
+       |> List.exists ~f:(fun (_, (loc : Loc.t)) ->
+         loc.loc_start.pos_cnum <= absolute_position
+         && absolute_position <= loc.loc_end.pos_cnum)
+  in
+  if inside_comment
+  then Suppressed
+  else (
+    let construct =
+      if is_hole then Complete_with_construct.dispatch_cmd position pipeline else None
+    in
+    let completion = Complete_by_prefix.dispatch_cmd ~prefix position pipeline in
+    let constructed_items =
+      if is_hole
+      then (
+        let supportsJumpToNextHole =
+          Experimental.bool
+            (State.experimental_client_capabilities state)
+            "jumpToNextHole"
+        in
+        Complete_with_construct.process_dispatch_resp
+          ~supportsJumpToNextHole
+          ~fallback_range:(edit_range merlin lsp_position)
+          ~position:lsp_position
+          construct)
+      else []
+    in
+    let completion_items =
+      Complete_by_prefix.process_dispatch_resp
+        ~supports_deprecated_field:capabilities.supports_deprecated_field
+        ~supports_deprecated_tag:capabilities.supports_deprecated_tag
+        ~supports_enum_member:capabilities.supports_enum_member
+        ~prefix
+        merlin
+        lsp_position
+        completion
+    in
+    Items (constructed_items @ completion_items))
+;;
+
+let log_failure configuration error =
+  Log.log ~section:"merlin" (fun () ->
+    Log.msg
+      "Merlin configuration failed while computing completion"
+      [ "mode", `String (Merlin_config.configuration_label configuration)
+      ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+      ])
+;;
+
+let deduplicate_items items =
+  List.fold_left items ~init:[] ~f:(fun items item ->
+    let identity = completion_identity item in
+    if
+      List.exists items ~f:(fun candidate ->
+        Poly.equal (completion_identity candidate) identity)
+    then items
+    else item :: items)
+  |> List.rev
+;;
+
+let merge_detail
+      (configured_items : (Merlin_config.configuration * CompletionItem.t) list)
+  =
+  match configured_items with
+  | [] -> None
+  | (_, first) :: rest
+    when List.for_all rest ~f:(fun (_, item) -> Poly.equal item.detail first.detail) ->
+    first.detail
+  | configured_items ->
+    Some
+      (List.map configured_items ~f:(fun (configuration, item) ->
+         let mode = Merlin_config.configuration_label configuration in
+         sprintf "%s: %s" mode (Option.value item.detail ~default:"<none>"))
+       |> String.concat ~sep:"\n")
+;;
+
+let intersect_items
+      (configured_items : (Merlin_config.configuration * CompletionItem.t list) list)
+  =
+  match configured_items with
+  | [] -> []
+  | (primary_configuration, primary_items) :: rest ->
+    deduplicate_items primary_items
+    |> List.filter_map ~f:(fun primary_item ->
+      let identity = completion_identity primary_item in
+      let matches =
+        List.map rest ~f:(fun (configuration, items) ->
+          List.find items ~f:(fun item -> Poly.equal (completion_identity item) identity)
+          |> Option.map ~f:(fun item -> configuration, item))
+      in
+      if List.exists matches ~f:Option.is_none
+      then None
+      else (
+        let configured_items =
+          (primary_configuration, primary_item) :: List.filter_opt matches
+        in
+        let detail = merge_detail configured_items in
+        Some { primary_item with detail }))
+;;
+
+let with_resolve_data params version item =
+  let data =
+    Resolve.yojson_of_t
+      { params; version = Some version; identity = Some (completion_identity item) }
+  in
+  { item with CompletionItem.data = Some data }
+;;
+
+let completion_list items =
+  Some (`CompletionList (CompletionList.create ~isIncomplete:false ~items ()))
+;;
+
+let complete (state : State.t) (params : CompletionParams.t) =
   Fiber.of_thunk (fun () ->
+    let { CompletionParams.textDocument = { uri }; position = pos; context; _ } =
+      params
+    in
     let doc = Document_store.get state.store uri in
     match Document.kind doc with
     | `Other -> Fiber.return None
     | `Merlin merlin ->
-      let capabilities = State.client_capabilities state in
-      let resolve =
-        match Capabilities.completion_resolve_properties capabilities with
-        | None -> false
-        | Some properties -> List.mem properties ~equal:String.equal "documentation"
+      let capabilities = completion_capabilities state in
+      let* { Document.Merlin.configurations; kind } =
+        Document.Merlin.configuration_context_exn merlin
       in
-      let supports_deprecated_tag =
-        Option.value_map
-          (Capabilities.completion_tag_support capabilities)
-          ~default:false
-          ~f:(fun value_set ->
-            Deprecation.tag_supported
-              value_set
-              ~tag:CompletionItemTag.Deprecated
-              ~equal:(fun CompletionItemTag.Deprecated Deprecated -> true))
-      in
-      let supports_deprecated_field =
-        (not supports_deprecated_tag)
-        && Capabilities.completion_deprecated_support capabilities
-      in
-      let supports_enum_member =
-        Option.value_map
-          (Capabilities.completion_item_kind_support capabilities)
-          ~default:false
-          ~f:(fun value_set ->
-            Capabilities.supported
-              value_set
-              ~tag:CompletionItemKind.EnumMember
-              ~equal:Poly.equal)
-      in
-      let* should_provide_completions =
+      let position = Position.logical pos in
+      let prefix = prefix_of_position ~short_path:false (Document.source doc) position in
+      let is_hole = Merlin_analysis.Typed_hole.can_be_hole prefix in
+      let check_comments =
         match context with
-        | Some context ->
-          (match context.triggerKind with
-           | TriggerCharacter ->
-             let+ inside_comment =
-               Check_for_comments.position_in_comment ~position:pos ~merlin
-             in
-             (match inside_comment with
-              | true -> `Ignore
-              | false -> `Provide_completions)
-           | Invoked | TriggerForIncompleteCompletions ->
-             Fiber.return `Provide_completions)
-        | None -> Fiber.return `Provide_completions
+        | Some { triggerKind = TriggerCharacter; _ } -> true
+        | Some { triggerKind = Invoked | TriggerForIncompleteCompletions; _ } | None ->
+          false
       in
-      (match should_provide_completions with
-       | `Ignore -> Fiber.return None
-       | `Provide_completions ->
-         let+ items =
-           let position = Position.logical pos in
-           let prefix =
-             prefix_of_position ~short_path:false (Document.source doc) position
-           in
-           if not (Merlin_analysis.Typed_hole.can_be_hole prefix)
-           then
-             Complete_by_prefix.complete
+      let absolute_position =
+        Text_document.absolute_position (Document.text_document doc) pos
+      in
+      let* results =
+        Document.Merlin.with_configurations
+          ~name:"completion"
+          merlin
+          ~configurations
+          (fun _ pipeline ->
+             run_completion_pass
+               state
                merlin
-               prefix
-               pos
-               ~supports_deprecated_field
-               ~supports_deprecated_tag
-               ~supports_enum_member
-               ~resolve
-           else (
-             let preselect_first =
-               if Capabilities.completion_preselect_support capabilities
-               then
-                 function
-                 | [] -> []
-                 | ci :: rest -> { ci with CompletionItem.preselect = Some true } :: rest
-               else fun x -> x
-             in
-             let+ construct_cmd_resp, compl_by_prefix_resp =
-               Document.Merlin.with_pipeline_exn
-                 ~name:"completion"
-                 merlin
-                 (fun pipeline ->
-                    let construct_cmd_resp =
-                      Complete_with_construct.dispatch_cmd position pipeline
-                    in
-                    let compl_by_prefix_resp =
-                      Complete_by_prefix.dispatch_cmd ~prefix position pipeline
-                    in
-                    construct_cmd_resp, compl_by_prefix_resp)
-             in
-             let construct_completionItems =
-               let supportsJumpToNextHole =
-                 Experimental.bool
-                   (State.experimental_client_capabilities state)
-                   "jumpToNextHole"
-               in
-               Complete_with_construct.process_dispatch_resp
-                 ~supportsJumpToNextHole
-                 ~fallback_range:(edit_range merlin pos)
-                 ~position:pos
-                 construct_cmd_resp
-             in
-             let compl_by_prefix_completionItems =
-               Complete_by_prefix.process_dispatch_resp
-                 ~resolve
-                 ~supports_deprecated_field
-                 ~supports_deprecated_tag
-                 ~supports_enum_member
-                 ~prefix
-                 merlin
-                 pos
-                 compl_by_prefix_resp
-             in
-             construct_completionItems @ compl_by_prefix_completionItems
-             |> reindex_sortText
-             |> preselect_first)
-         in
-         Some (`CompletionList (CompletionList.create ~isIncomplete:false ~items ()))))
+               capabilities
+               ~check_comments
+               ~absolute_position
+               ~position
+               ~lsp_position:pos
+               ~prefix
+               ~is_hole
+               pipeline)
+      in
+      let results = Merlin_dot_protocol.Nonempty_list.to_list results in
+      let failure =
+        List.find_map results ~f:(fun { Document.Merlin.configuration; result } ->
+          match result with
+          | Ok _ -> None
+          | Error error ->
+            log_failure configuration error;
+            Some ())
+      in
+      if Option.is_some failure
+      then Fiber.return (completion_list [])
+      else if
+        List.exists results ~f:(fun { Document.Merlin.result; _ } ->
+          match result with
+          | Ok Suppressed -> true
+          | Ok (Items _) | Error _ -> false)
+      then Fiber.return None
+      else (
+        let configured_items =
+          List.map results ~f:(fun { Document.Merlin.configuration; result } ->
+            match result with
+            | Ok (Items items) -> configuration, items
+            | Ok Suppressed | Error _ -> assert false)
+        in
+        let items = intersect_items configured_items in
+        let items =
+          if capabilities.resolve
+          then List.map items ~f:(with_resolve_data params (Document.version doc))
+          else items
+        in
+        let keyword_items =
+          match kind with
+          | Document.Kind.Impl -> Complete_by_prefix.complete_keywords pos prefix
+          | Intf -> []
+        in
+        let items = keyword_items @ items |> reindex_sortText in
+        let items =
+          if is_hole && capabilities.supports_preselect
+          then (
+            match items with
+            | [] -> []
+            | item :: rest -> { item with CompletionItem.preselect = Some true } :: rest)
+          else items
+        in
+        Fiber.return (completion_list items)))
 ;;
 
 let format_doc ~markdown doc =
@@ -482,43 +609,201 @@ let format_doc ~markdown doc =
        | Raw value -> { kind = MarkupKind.PlainText; MarkupContent.value })
 ;;
 
-let resolve doc (compl : CompletionItem.t) (resolve : Resolve.t) query_doc ~markdown =
+let mode_documentation ~markdown configured_docs =
+  match configured_docs with
+  | [] -> None
+  | (_, first) :: rest when List.for_all rest ~f:(fun (_, doc) -> Poly.equal doc first) ->
+    Option.map first ~f:(format_doc ~markdown)
+  | configured_docs ->
+    let render = function
+      | None -> ""
+      | Some doc ->
+        if markdown
+        then (
+          match Doc_to_md.translate doc with
+          | Markdown value | Raw value -> value)
+        else doc
+    in
+    let value =
+      List.map configured_docs ~f:(fun (configuration, doc) ->
+        let mode = Merlin_config.configuration_label configuration in
+        let doc = render doc in
+        if markdown then sprintf "### %s\n\n%s" mode doc else sprintf "%s:\n%s" mode doc)
+      |> String.concat ~sep:(if markdown then "\n\n---\n\n" else "\n\n")
+    in
+    if markdown
+    then Some (`MarkupContent { MarkupContent.kind = MarkupKind.Markdown; value })
+    else Some (`String value)
+;;
+
+let completion_change (identity : CompletionItem.t) =
+  match identity.textEdit with
+  | None -> None
+  | Some (`TextEdit { TextEdit.range; newText }) ->
+    Some
+      (`TextDocumentContentChangePartial
+          (TextDocumentContentChangePartial.create ~range ~text:newText ()))
+  | Some (`InsertReplaceEdit { Lsp.Types.InsertReplaceEdit.replace = range; newText; _ })
+    ->
+    Some
+      (`TextDocumentContentChangePartial
+          (TextDocumentContentChangePartial.create ~range ~text:newText ()))
+;;
+
+let legacy_completion_change doc position label =
+  let logical_position = Position.logical position in
+  let source = Document.Merlin.source doc in
+  let prefix = prefix_of_position ~short_path:true source logical_position in
+  let suffix =
+    let is_operator =
+      (not (String.is_empty prefix))
+      && String.for_all prefix ~f:Ocaml_operator.is_symbolic_character
+    in
+    let is_char =
+      if is_operator then Ocaml_operator.is_symbolic_character else ident_char
+    in
+    suffix_of_position ~is_char source logical_position
+  in
+  let start = { position with character = position.character - String.length prefix } in
+  let end_ = { position with character = position.character + String.length suffix } in
+  `TextDocumentContentChangePartial
+    (TextDocumentContentChangePartial.create
+       ~range:(Range.create ~start ~end_)
+       ~text:label
+       ())
+;;
+
+let resolve_legacy doc (compl : CompletionItem.t) params ~markdown =
+  let position = params.CompletionParams.position in
+  let logical_position = Position.logical position in
+  let* { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn doc
+  in
+  let change = legacy_completion_change doc position compl.label in
+  let doc =
+    Document.Merlin.to_doc doc
+    |> (fun doc ->
+    Document.with_merlin_configuration doc (Merlin_config.primary configurations))
+    |> (fun doc -> Document.update_text doc [ change ])
+    |> Document.merlin_exn
+  in
+  let+ documentation = Document.Merlin.doc_comment doc logical_position in
+  let documentation = Option.map documentation ~f:(format_doc ~markdown) in
+  { compl with documentation; data = None }
+;;
+
+let resolve
+      (state : State.t)
+      doc
+      (compl : CompletionItem.t)
+      (resolve : Resolve.t)
+      ~markdown
+  =
   Fiber.of_thunk (fun () ->
-    (* Due to merlin's API, we create a version of the given document with the
-       applied completion item and pass it to merlin to get the docs for the
-       [compl.label] *)
-    let position : Position.t = resolve.position in
-    let logical_position = Position.logical position in
-    let doc =
-      let prefix =
-        prefix_of_position ~short_path:true (Document.Merlin.source doc) logical_position
-      in
-      let suffix =
-        let is_operator =
-          (not (String.is_empty prefix))
-          && String.for_all prefix ~f:Ocaml_operator.is_symbolic_character
+    match resolve.version, resolve.identity with
+    | None, None -> resolve_legacy doc compl resolve.params ~markdown
+    | None, Some _ | Some _, None -> Fiber.return compl
+    | Some version, Some identity ->
+      if
+        Document.version (Document.Merlin.to_doc doc) <> version
+        || not (Poly.equal (completion_identity compl) identity)
+      then Fiber.return compl
+      else (
+        let params = resolve.params in
+        let { CompletionParams.position; context; _ } = params in
+        let logical_position = Position.logical position in
+        let prefix =
+          prefix_of_position
+            ~short_path:false
+            (Document.Merlin.source doc)
+            logical_position
         in
-        let is_char =
-          if is_operator then Ocaml_operator.is_symbolic_character else ident_char
+        let is_hole = Merlin_analysis.Typed_hole.can_be_hole prefix in
+        let check_comments =
+          match context with
+          | Some { triggerKind = TriggerCharacter; _ } -> true
+          | Some { triggerKind = Invoked | TriggerForIncompleteCompletions; _ } | None ->
+            false
         in
-        suffix_of_position ~is_char (Document.Merlin.source doc) logical_position
-      in
-      let complete =
-        let start =
-          { position with character = position.character - String.length prefix }
+        let absolute_position =
+          Text_document.absolute_position
+            (Document.Merlin.to_doc doc |> Document.text_document)
+            position
         in
-        let end_ =
-          { position with character = position.character + String.length suffix }
+        let capabilities = completion_capabilities state in
+        let* { Document.Merlin.configurations; _ } =
+          Document.Merlin.configuration_context_exn doc
         in
-        let range = Range.create ~start ~end_ in
-        `TextDocumentContentChangePartial
-          (TextDocumentContentChangePartial.create ~range ~text:compl.label ())
-      in
-      Document.update_text (Document.Merlin.to_doc doc) [ complete ]
-    in
-    let+ documentation =
-      let+ documentation = query_doc (Document.merlin_exn doc) logical_position in
-      Option.map ~f:(format_doc ~markdown) documentation
-    in
-    { compl with documentation; data = None })
+        let* passes =
+          Document.Merlin.with_configurations
+            ~name:"completion-resolve-revalidate"
+            doc
+            ~configurations
+            (fun _ pipeline ->
+               run_completion_pass
+                 state
+                 doc
+                 capabilities
+                 ~check_comments
+                 ~absolute_position
+                 ~position:logical_position
+                 ~lsp_position:position
+                 ~prefix
+                 ~is_hole
+                 pipeline)
+        in
+        let portable =
+          Merlin_dot_protocol.Nonempty_list.to_list passes
+          |> List.for_all ~f:(fun { Document.Merlin.configuration; result } ->
+            match result with
+            | Error error ->
+              log_failure configuration error;
+              false
+            | Ok Suppressed -> false
+            | Ok (Items items) ->
+              List.exists items ~f:(fun item ->
+                Poly.equal (completion_identity item) identity))
+        in
+        if not portable
+        then Fiber.return compl
+        else (
+          match completion_change identity with
+          | None -> Fiber.return compl
+          | Some change ->
+            let updated =
+              Document.update_text (Document.Merlin.to_doc doc) [ change ]
+              |> Document.merlin_exn
+            in
+            let* docs =
+              Document.Merlin.with_configurations
+                ~name:"completion-resolve-documentation"
+                updated
+                ~configurations
+                (fun _ pipeline ->
+                   match
+                     Query_commands.dispatch
+                       pipeline
+                       (Query_protocol.Document (None, logical_position))
+                   with
+                   | `Found doc | `Builtin doc -> Some doc
+                   | _ -> None)
+            in
+            let docs = Merlin_dot_protocol.Nonempty_list.to_list docs in
+            if
+              List.exists docs ~f:(fun { Document.Merlin.configuration; result } ->
+                match result with
+                | Ok _ -> false
+                | Error error ->
+                  log_failure configuration error;
+                  true)
+            then Fiber.return compl
+            else (
+              let documentation =
+                List.map docs ~f:(fun { Document.Merlin.configuration; result } ->
+                  match result with
+                  | Ok doc -> configuration, doc
+                  | Error _ -> assert false)
+                |> mode_documentation ~markdown
+              in
+              Fiber.return { compl with documentation; data = None }))))
 ;;

@@ -21,16 +21,17 @@
     "merlin": {
       "flake": false,
       "locked": {
-        "lastModified": 1785489700,
-        "narHash": "sha256-58ZEK28mGOrQPDnkmQ+H5KaIvGdkdCJmlLGR96fZtIA=",
-        "owner": "ocaml",
+        "lastModified": 1785586960,
+        "narHash": "sha256-ep6Vw3OesSQL7IUW5q/Z+12IBsoombQGvN0qJ+hOv10=",
+        "owner": "anmonteiro",
         "repo": "merlin",
-        "rev": "a46ee0b7abad3079ec9eccbfcc3dc1ce14d4ce61",
+        "rev": "3b676b83bcf9f7b7c2c235a21937d2505b76c6f8",
         "type": "github"
       },
       "original": {
-        "owner": "ocaml",
+        "owner": "anmonteiro",
         "repo": "merlin",
+        "rev": "3b676b83bcf9f7b7c2c235a21937d2505b76c6f8",
         "type": "github"
       }
     },

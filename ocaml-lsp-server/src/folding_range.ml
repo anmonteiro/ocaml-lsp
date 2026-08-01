@@ -324,10 +324,54 @@ let compute (state : State.t) (params : FoldingRangeParams.t) =
     | `Other -> Fiber.return None
     | `Merlin m ->
       let config = client_config state in
-      let+ ranges =
-        Document.Merlin.with_pipeline_exn ~name:"folding range" m (fun pipeline ->
-          let parsetree = Mpipeline.reader_parsetree pipeline in
-          fold_over_parsetree config parsetree)
+      let* { Document.Merlin.configurations; _ } =
+        Document.Merlin.configuration_context_exn m
+      in
+      let+ configured =
+        Document.Merlin.with_configurations
+          ~name:"folding range"
+          m
+          ~configurations
+          (fun _ pipeline ->
+             let parsetree = Mpipeline.reader_parsetree pipeline in
+             fold_over_parsetree config parsetree)
+      in
+      let range_sets, failures =
+        Merlin_dot_protocol.Nonempty_list.to_list configured
+        |> List.fold_left
+             ~init:([], [])
+             ~f:
+               (fun
+                 (range_sets, failures)
+                 ({ configuration; result } : _ Document.Merlin.configured_result)
+               ->
+               match result with
+               | Error error -> range_sets, (configuration, error) :: failures
+               | Ok found -> found :: range_sets, failures)
+      in
+      List.iter failures ~f:(fun (configuration, error) ->
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            "Merlin folding range configuration failed"
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]));
+      let range_sets = List.rev range_sets in
+      if List.is_empty range_sets
+      then (
+        let primary = Merlin_config.primary configurations in
+        let _, error =
+          List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+          |> Option.value ~default:(List.hd_exn failures)
+        in
+        Exn_with_backtrace.reraise error);
+      let ranges =
+        List.fold_left range_sets ~init:[] ~f:(fun accumulated ranges ->
+          let unseen =
+            List.filter ranges ~f:(fun range ->
+              not (List.exists accumulated ~f:(Poly.equal range)))
+          in
+          accumulated @ unseen)
       in
       let ranges =
         (* [rangeLimit] is a hint, so returning fewer ranges is allowed. *)

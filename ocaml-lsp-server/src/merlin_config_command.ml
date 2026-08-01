@@ -11,7 +11,10 @@ let command_run server store =
         | `Other -> acc
         | `Merlin m -> m :: acc)
       |> Fiber.parallel_map ~f:(fun doc ->
-        let+ config = Document.Merlin.mconfig doc in
+        let+ { Document.Merlin.configurations; _ } =
+          Document.Merlin.configuration_context_exn doc
+        in
+        let config = (Merlin_config.primary configurations).config in
         let config : Json.t = (Mconfig.dump config :> Json.t) in
         let uri = Document.uri (Document.Merlin.to_doc doc) in
         Uri.to_string uri, config)

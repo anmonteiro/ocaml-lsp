@@ -180,7 +180,7 @@ let%expect_test "active parameter placement follows client capabilities" =
     activeParameterSupport true
     {
       "SignatureHelp.activeParameter": 1,
-      "SignatureInformation.activeParameter": "<omitted>"
+      "SignatureInformation.activeParameter": 1
     }
     |}]
 ;;

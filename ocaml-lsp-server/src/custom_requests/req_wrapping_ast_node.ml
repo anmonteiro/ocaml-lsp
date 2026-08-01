@@ -43,6 +43,7 @@ let on_request ~params state =
            ~message:"not a merlin document"
            ())
     | `Merlin doc ->
+      let* doc = Util.primary_merlin doc in
       let pos = Position.logical cursor_position in
       let+ node =
         Document.Merlin.with_pipeline_exn ~name:"wrapping-ast-node" doc (fun pipeline ->
