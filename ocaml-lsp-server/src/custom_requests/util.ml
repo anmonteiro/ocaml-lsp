@@ -1,24 +1,64 @@
 open Import
+open Fiber.O
 
 type 't req_params_spec =
   { params_schema : Jsonrpc.Structured.t
   ; of_jsonrpc_params : Jsonrpc.Structured.t -> 't option
   }
 
-let with_merlin state uri ~default f =
+let fixed_merlin merlin configuration =
+  Document.Merlin.to_doc merlin
+  |> (fun doc -> Document.with_merlin_configuration doc configuration)
+  |> Document.merlin_exn
+;;
+
+let primary_merlin merlin =
+  let+ { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn merlin
+  in
+  fixed_merlin merlin (Merlin_config.primary configurations)
+;;
+
+let singleton_merlin merlin =
+  let+ { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn merlin
+  in
+  match Merlin_config.configuration_list configurations with
+  | [ configuration ] -> fixed_merlin merlin configuration
+  | _ :: _ :: _ ->
+    Jsonrpc.Response.Error.raise
+      (Jsonrpc.Response.Error.make
+         ~code:RequestFailed
+         ~message:
+           "This request is unavailable for files with multiple Merlin configurations"
+         ())
+  | [] -> invalid_arg "Util.singleton_merlin"
+;;
+
+let with_selected_merlin select state uri ~default f =
   let doc = Document_store.get state.State.store uri in
   match Document.kind doc with
   | `Other -> Fiber.return default
-  | `Merlin merlin -> f merlin
+  | `Merlin merlin ->
+    let* merlin = select merlin in
+    f merlin
 ;;
 
-let with_pipeline state uri ~default f =
-  with_merlin state uri ~default (fun merlin ->
+let with_primary_merlin state uri ~default f =
+  with_selected_merlin primary_merlin state uri ~default f
+;;
+
+let with_singleton_merlin state uri ~default f =
+  with_selected_merlin singleton_merlin state uri ~default f
+;;
+
+let with_primary_pipeline state uri ~default f =
+  with_primary_merlin state uri ~default (fun merlin ->
     Document.Merlin.with_pipeline_exn merlin f)
 ;;
 
-let with_impl_pipeline state uri ~default f =
-  with_merlin state uri ~default (fun merlin ->
+let with_singleton_impl_pipeline state uri ~default f =
+  with_singleton_merlin state uri ~default (fun merlin ->
     match Document.Merlin.kind merlin with
     | Document.Kind.Intf -> Fiber.return default
     | Document.Kind.Impl -> Document.Merlin.with_pipeline_exn merlin f)

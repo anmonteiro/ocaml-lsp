@@ -55,7 +55,11 @@ let on_request ~params state =
       |> Request_params.t_of_yojson
     in
     let* typ =
-      Util.with_pipeline state uri ~default:None (dispatch_type_expr position expression)
+      Util.with_primary_pipeline
+        state
+        uri
+        ~default:None
+        (dispatch_type_expr position expression)
     in
     match typ with
     | Some typ ->

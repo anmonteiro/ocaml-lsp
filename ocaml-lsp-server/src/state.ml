@@ -11,7 +11,14 @@ type init =
       ; position_encoding : [ `UTF16 | `UTF8 ]
       }
 
-type hover_extended = { mutable history : (Uri.t * Position.t * int) option }
+type hover_history =
+  { uri : Uri.t
+  ; position : Position.t
+  ; version : int
+  ; verbosity : int
+  }
+
+type hover_extended = { mutable history : hover_history option }
 
 type t =
   { store : Document_store.t

@@ -31,7 +31,7 @@ type doc =
   ; (* promotion refcount. dynamic registration is needed only while the
        document is closed and this count is positive *)
     promotions : int
-  ; mutable semantic_tokens_cache : semantic_tokens_cache option
+  ; mutable semantic_tokens_cache : semantic_tokens_cache list
   }
 
 type t =
@@ -102,7 +102,7 @@ let open_document t doc =
     Hashtbl.set
       t.db
       ~key
-      ~data:(ref { document = Some doc; promotions = 0; semantic_tokens_cache = None });
+      ~data:(ref { document = Some doc; promotions = 0; semantic_tokens_cache = [] });
     Fiber.return ()
   | Some d ->
     (* if there's no document, then we just opened it to track promotions.
@@ -153,7 +153,7 @@ let close_document t uri =
         Hashtbl.remove t.db uri;
         close_doc ())
       else (
-        doc := { !doc with document = None };
+        doc := { !doc with document = None; semantic_tokens_cache = [] };
         Fiber.fork_and_join_unit close_doc (fun () -> register_request t [ uri ])))
 ;;
 
@@ -175,7 +175,7 @@ let register_promotions t uris =
   List.filter uris ~f:(fun uri ->
     match Hashtbl.find t.db uri with
     | None ->
-      let doc = ref { document = None; promotions = 1; semantic_tokens_cache = None } in
+      let doc = ref { document = None; promotions = 1; semantic_tokens_cache = [] } in
       Hashtbl.set t.db ~key:uri ~data:doc;
       true
     | Some doc ->
@@ -189,13 +189,21 @@ let update_semantic_tokens_cache
   =
   fun t uri ~resultId ~tokens ->
   let doc = get' t uri in
-  !doc.semantic_tokens_cache <- Some { resultId; tokens }
+  let cache =
+    { resultId; tokens }
+    :: List.filter !doc.semantic_tokens_cache ~f:(fun cached ->
+      not (String.equal cached.resultId resultId))
+  in
+  !doc.semantic_tokens_cache <- List.take cache 2
 ;;
 
-let get_semantic_tokens_cache : t -> Uri.t -> semantic_tokens_cache option =
-  fun t uri ->
+let get_semantic_tokens_cache
+  : t -> Uri.t -> resultId:string -> semantic_tokens_cache option
+  =
+  fun t uri ~resultId ->
   let doc = get' t uri in
-  !doc.semantic_tokens_cache
+  List.find !doc.semantic_tokens_cache ~f:(fun cached ->
+    String.equal cached.resultId resultId)
 ;;
 
 let parallel_iter t ~f =

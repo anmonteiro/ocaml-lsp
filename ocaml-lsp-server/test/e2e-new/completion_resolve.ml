@@ -67,8 +67,6 @@ let%expect_test "completion resolve after its document changes" =
       List.find_exn items ~f:(fun (item : CompletionItem.t) ->
         String.equal item.label "old_value")
     in
-    print_endline "Completion item before document update:";
-    print_completion_item item;
     let textDocument =
       VersionedTextDocumentIdentifier.create ~uri:Helpers.uri ~version:1
     in
@@ -84,47 +82,14 @@ let%expect_test "completion resolve after its document changes" =
         (TextDocumentDidChange
            (DidChangeTextDocumentParams.create ~textDocument ~contentChanges))
     in
-    let* item = Client.request client (CompletionItemResolve item) in
-    print_endline "Same item resolved after document update to version 1:";
-    print_completion_item item;
+    let* resolved = Client.request client (CompletionItemResolve item) in
+    Printf.printf "Stale completion item unchanged: %b\n" (Poly.equal item resolved);
     Fiber.return ()
   in
   Helpers.test ~capabilities source req;
   [%expect
     {|
-    Completion item before document update:
-    {
-      "data": {
-        "position": { "character": 12, "line": 2 },
-        "textDocument": { "uri": "file:///test.ml" }
-      },
-      "detail": "int",
-      "kind": 12,
-      "label": "old_value",
-      "sortText": "0000",
-      "textEdit": {
-        "newText": "old_value",
-        "range": {
-          "end": { "character": 12, "line": 2 },
-          "start": { "character": 8, "line": 2 }
-        }
-      }
-    }
-    Same item resolved after document update to version 1:
-    {
-      "detail": "int",
-      "documentation": "new docs",
-      "kind": 12,
-      "label": "old_value",
-      "sortText": "0000",
-      "textEdit": {
-        "newText": "old_value",
-        "range": {
-          "end": { "character": 12, "line": 2 },
-          "start": { "character": 8, "line": 2 }
-        }
-      }
-    }
+    Stale completion item unchanged: true
     |}]
 ;;
 

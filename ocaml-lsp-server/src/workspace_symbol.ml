@@ -239,7 +239,7 @@ let make_uri_resolver ~root_dir ~build_dir : (Loc.t -> Uri.t option) Staged.t =
             then [ Filename.concat root_dir fname; Filename.concat build_dir fname ]
             else [ fname ]
           in
-          List.find candidates ~f:Sys.file_exists |> Option.map ~f:Uri.of_path)
+          List.find candidates ~f:Sys.file_exists |> Option.map ~f:Source_path.of_path)
       in
       cache := Map.set !cache ~key:fname ~data:uri;
       uri)
@@ -354,6 +354,20 @@ let run
       (workspace_folders : WorkspaceFolder.t list)
       (cancel : Fiber.Cancel.t option)
   =
+  let deduplicate symbols =
+    let _, symbols =
+      List.fold_left
+        symbols
+        ~init:(Set.Poly.empty, [])
+        ~f:(fun (seen, deduplicated) (symbol : SymbolInformation.t) ->
+          let { Location.uri; range } = symbol.location in
+          let key = uri, range, symbol.name, symbol.kind, symbol.containerName in
+          if Set.mem seen key
+          then seen, deduplicated
+          else Set.add seen key, symbol :: deduplicated)
+    in
+    List.rev symbols
+  in
   let filter =
     match query with
     | "" -> fun x -> x
@@ -373,7 +387,8 @@ let run
            List.concat_map
              ~f:
                (symbols_from_cm_file ~supports_deprecated_tag ~filter ~resolve_uri cancel)
-             cm_files))
+             cm_files)
+       |> deduplicate)
   with
   | Cancelled -> Error `Cancelled
 ;;

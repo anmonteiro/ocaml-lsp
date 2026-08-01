@@ -9,4 +9,4 @@ val for_uri
   :  can_create_file:bool
   -> ShowDocumentClientCapabilities.t option
   -> Document.t
-  -> CodeAction.t list
+  -> CodeAction.t list Fiber.t

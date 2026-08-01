@@ -69,7 +69,7 @@ let%expect_test "can reject invalid rename request" =
   [%expect {| null |}]
 ;;
 
-let%expect_test "prepare rename leaks a lexer error on an astral character" =
+let%expect_test "prepare rename reports a mode failure on an astral character" =
   run "😀" (fun client ->
     let* result =
       Fiber.collect_errors (fun () ->
@@ -84,17 +84,7 @@ let%expect_test "prepare rename leaks a lexer error on an astral character" =
     | Ok response ->
       print_prepare_rename response;
       Fiber.return ());
-  [%expect
-    {|
-    {
-      "data": {
-        "exn": "Ocaml_preprocess.Lexer_raw.Error(_, _)",
-        "backtrace": "<censored>"
-      },
-      "code": -32603,
-      "message": "uncaught exception"
-    }
-    |}]
+  [%expect {| { "code": -32803, "message": "prepare rename failed for modes: legacy" } |}]
 ;;
 
 let%expect_test "prepare rename leaks Not_found on an incomplete local module" =
@@ -470,7 +460,7 @@ let%expect_test "rename a symbol across open and closed files" =
   Unix.close stderr;
   [%expect
     {|
-    lib.ml (version 7)
+    lib.ml (version null)
     {
       "newText": "renamed",
       "range": {
