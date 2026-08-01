@@ -169,7 +169,7 @@ let on_request ~(params : Jsonrpc.Structured.t option) (server : State.t Server.
     Request_params.of_jsonrpc_params_exn params
   in
   let+ res =
-    Hover_req.handle
+    Hover_req.handle_primary
       server
       { HoverParams.textDocument = text_document
       ; position = cursor_position

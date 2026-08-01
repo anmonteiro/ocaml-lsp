@@ -69,22 +69,31 @@ let code_actions
   in
   match Document.kind doc, targets with
   | `Merlin merlin, _ :: _ when available capabilities ->
-    let+ actions =
-      (* TODO: Merlin Jump command that returns all available jump locations for a source code buffer. *)
-      Fiber.parallel_map targets ~f:(fun target ->
-        let+ res = process_jump_request ~merlin ~position:params.range.start ~target in
-        let open Option.O in
-        let* lexing_pos = res in
-        let+ position = Position.of_lexical_position lexing_pos in
-        let uri = Document.uri doc in
-        let range = { Range.start = position; end_ = position } in
-        let title = sprintf "%s jump" (String.capitalize (rename_target target)) in
-        let command =
-          let arguments = [ DocumentUri.yojson_of_t uri; Range.yojson_of_t range ] in
-          Command.create ~title ~command:command_name ~arguments ()
-        in
-        CodeAction.create ~title ~kind:(kind target) ~command ())
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
     in
-    List.filter_opt actions
+    (match Merlin_config.configuration_list configurations with
+     | [ configuration ] ->
+       let doc = Document.with_merlin_configuration doc configuration in
+       let merlin = Document.merlin_exn doc in
+       let+ actions =
+         (* TODO: Merlin Jump command that returns all available jump locations for a source code buffer. *)
+         Fiber.parallel_map targets ~f:(fun target ->
+           let+ res = process_jump_request ~merlin ~position:params.range.start ~target in
+           let open Option.O in
+           let* lexing_pos = res in
+           let+ position = Position.of_lexical_position lexing_pos in
+           let uri = Document.uri doc in
+           let range = { Range.start = position; end_ = position } in
+           let title = sprintf "%s jump" (String.capitalize (rename_target target)) in
+           let command =
+             let arguments = [ DocumentUri.yojson_of_t uri; Range.yojson_of_t range ] in
+             Command.create ~title ~command:command_name ~arguments ()
+           in
+           CodeAction.create ~title ~kind:(kind target) ~command ())
+       in
+       List.filter_opt actions
+     | _ :: _ :: _ -> Fiber.return []
+     | [] -> invalid_arg "Action_jump.code_actions")
   | _ -> Fiber.return []
 ;;

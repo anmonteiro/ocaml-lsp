@@ -53,6 +53,38 @@ let identifier_range source (range : Range.t) =
     else range
 ;;
 
+let request_failed message =
+  Jsonrpc.Response.Error.raise
+    (Jsonrpc.Response.Error.make ~code:RequestFailed ~message ())
+;;
+
+let configured_values ~operation results =
+  let values, errors =
+    Merlin_dot_protocol.Nonempty_list.to_list results
+    |> List.fold_left ~init:([], []) ~f:(fun (values, errors) result ->
+      let { Document.Merlin.configuration; result } = result in
+      match result with
+      | Ok value -> (configuration, value) :: values, errors
+      | Error error -> values, (configuration, error) :: errors)
+  in
+  match errors with
+  | [] -> List.rev values
+  | errors ->
+    List.iter errors ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          ("Merlin configuration failed while computing " ^ operation)
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    let modes =
+      List.rev_map errors ~f:(fun (configuration, _) ->
+        Merlin_config.configuration_label configuration)
+      |> String.concat ~sep:", "
+    in
+    request_failed (sprintf "%s failed for modes: %s" operation modes)
+;;
+
 let prepare
       (state : State.t)
       { PrepareRenameParams.textDocument = { uri }; position; workDoneToken = _ }
@@ -61,21 +93,42 @@ let prepare
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin merlin ->
-    let+ occurrences, (_ : Query_protocol.occurrences_status) =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
+    let+ results =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         merlin
+        ~configurations
         (Query_protocol.Occurrences (`Ident_at (Position.logical position), `Buffer))
     in
     let source = Document.source doc in
-    List.find_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-      if occurrence.is_stale
-      then None
-      else (
-        let range = Range.of_loc occurrence.loc |> identifier_range source in
-        if Range.contains_position range position ~inclusive_end:true
-        then Some range
-        else None))
+    let ranges =
+      configured_values ~operation:"prepare rename" results
+      |> List.map ~f:(fun (configuration, (occurrences, _)) ->
+        let range =
+          List.find_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
+            if occurrence.is_stale
+            then None
+            else (
+              let range = Range.of_loc occurrence.loc |> identifier_range source in
+              if Lsp.Range.contains_position range position ~inclusive_end:true
+              then Some range
+              else None))
+        in
+        configuration, range)
+    in
+    (match ranges with
+     | [] -> None
+     | (_, None) :: _ -> None
+     | (_, Some first) :: rest ->
+       if
+         List.for_all rest ~f:(function
+           | _, Some range -> Poly.equal range first
+           | _, None -> false)
+       then Some first
+       else request_failed "The applicable modes produced different rename ranges")
 ;;
 
 let workspace_edit_of_locations ~document_changes ~documents ~new_name locations =
@@ -149,29 +202,51 @@ let rename (state : State.t) { RenameParams.textDocument = { uri }; position; ne
         state.store
         ~init:(Map.empty (module Uri))
         ~f:(fun document documents ->
-          Map.set documents ~key:(Document.uri document) ~data:document)
+          let uri = Document.uri document |> Source_path.uri in
+          Map.set documents ~key:uri ~data:document)
+    in
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
     in
     let command =
       Query_protocol.Occurrences (`Ident_at (Position.logical position), `Renaming)
     in
-    let+ occurrences, _desync =
-      Document.Merlin.dispatch_exn ~name:"rename" merlin command
+    let+ results =
+      Document.Merlin.dispatch_all ~name:"rename" merlin ~configurations command
     in
-    let locations =
-      List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-        match occurrence.is_stale with
-        | true -> None
-        | false ->
-          let loc = occurrence.loc in
-          let uri =
-            match loc.loc_start.pos_fname with
-            | "" -> uri
-            | path -> Uri.of_path path
-          in
-          Some (uri, Range.of_loc loc))
-    in
+    let canonical_uri = Source_path.uri uri in
     let document_changes =
       Capabilities.workspace_edit_document_changes (State.client_capabilities state)
     in
-    workspace_edit_of_locations ~document_changes ~documents ~new_name:newName locations
+    let edits =
+      configured_values ~operation:"rename" results
+      |> List.map ~f:(fun (configuration, (occurrences, _)) ->
+        let locations =
+          List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
+            if occurrence.is_stale
+            then None
+            else (
+              let loc = occurrence.loc in
+              let uri =
+                match loc.loc_start.pos_fname with
+                | "" -> canonical_uri
+                | path -> Source_path.of_path path
+              in
+              Some (uri, Range.of_loc loc)))
+        in
+        let edit =
+          workspace_edit_of_locations
+            ~document_changes
+            ~documents
+            ~new_name:newName
+            locations
+        in
+        configuration, edit)
+    in
+    (match edits with
+     | [] -> WorkspaceEdit.create ()
+     | (_, first) :: rest ->
+       if List.for_all rest ~f:(fun (_, edit) -> Poly.equal edit first)
+       then first
+       else request_failed "The applicable modes produced different rename targets")
 ;;

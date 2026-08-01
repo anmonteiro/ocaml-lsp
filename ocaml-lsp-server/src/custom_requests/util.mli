@@ -1,15 +1,30 @@
 open Import
 
-val with_merlin
+val primary_merlin : Document.Merlin.t -> Document.Merlin.t Fiber.t
+val singleton_merlin : Document.Merlin.t -> Document.Merlin.t Fiber.t
+
+val with_primary_merlin
   :  State.t
   -> Uri.t
   -> default:'a
   -> (Document.Merlin.t -> 'a Fiber.t)
   -> 'a Fiber.t
 
-val with_pipeline : State.t -> Uri.t -> default:'a -> (Mpipeline.t -> 'a) -> 'a Fiber.t
+val with_singleton_merlin
+  :  State.t
+  -> Uri.t
+  -> default:'a
+  -> (Document.Merlin.t -> 'a Fiber.t)
+  -> 'a Fiber.t
 
-val with_impl_pipeline
+val with_primary_pipeline
+  :  State.t
+  -> Uri.t
+  -> default:'a
+  -> (Mpipeline.t -> 'a)
+  -> 'a Fiber.t
+
+val with_singleton_impl_pipeline
   :  State.t
   -> Uri.t
   -> default:'a

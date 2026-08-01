@@ -54,8 +54,7 @@ let on_request ~(params : Jsonrpc.Structured.t option) (state : State.t) =
                 (Uri.to_string uri))
            ()
     | Some doc ->
-      let+ holes =
-        Typed_hole.all ~pipeline_name:"typed-holes" (Document.merlin_exn doc)
-      in
+      let* merlin = Document.merlin_exn doc |> Util.primary_merlin in
+      let+ holes = Typed_hole.all ~pipeline_name:"typed-holes" merlin in
       yojson_of_t holes)
 ;;
