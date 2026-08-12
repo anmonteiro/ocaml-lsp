@@ -373,15 +373,6 @@ let extract_related_errors uri raw_message =
   | _ -> raw_message, None
 ;;
 
-let clamp_range_to_source source ({ Range.start; end_ } : Range.t) =
-  let clamp position =
-    let offset = Msource.get_offset source (Position.logical position) in
-    let (`Logical (line, character)) = Msource.get_logical source offset in
-    Position.of_logical ~line ~character
-  in
-  Range.create ~start:(clamp start) ~end_:(clamp end_)
-;;
-
 let first_n_lines_of_range (range : Range.t) n =
   if range.end_.line - range.start.line < n
   then range
@@ -396,8 +387,7 @@ let error_to_diagnostics ~diagnostics ~merlin error =
   let create_diagnostic = Diagnostic.create ~source:ocamllsp_source in
   let uri = Document.uri doc |> Source_path.uri in
   let loc = Loc.loc_of_report error in
-  let source = Document.Merlin.source merlin in
-  let original_range = Range.of_loc loc |> clamp_range_to_source source in
+  let original_range = Range.of_loc loc in
   let range =
     if diagnostics.shorten_merlin_diagnostics
     then first_n_lines_of_range original_range 1
@@ -421,7 +411,7 @@ let error_to_diagnostics ~diagnostics ~merlin error =
          , Some
              (List.map error.sub ~f:(fun (sub : Loc.msg) ->
                 let location =
-                  let range = Range.of_loc sub.loc |> clamp_range_to_source source in
+                  let range = Range.of_loc sub.loc in
                   Location.create ~range ~uri
                 in
                 let message = make_message Loc.print_sub_msg sub in
@@ -529,7 +519,6 @@ let merge_configured_diagnostics configurations configured =
 let merlin_diagnostics diagnostics merlin ~generation =
   let doc = Document.Merlin.to_doc merlin in
   let uri = Document.uri doc in
-  let source = Document.Merlin.source merlin in
   let create_diagnostic = Diagnostic.create ~source:ocamllsp_source in
   let open Fiber.O in
   let* context = Document.Merlin.configuration_context merlin in
@@ -568,7 +557,7 @@ let merlin_diagnostics diagnostics merlin ~generation =
              let holes_as_err_diags =
                Query_commands.dispatch pipeline Holes
                |> List.rev_map ~f:(fun (loc, typ) ->
-                 let range = Range.of_loc loc |> clamp_range_to_source source in
+                 let range = Range.of_loc loc in
                  let severity = DiagnosticSeverity.Error in
                  let message =
                    "This typed hole should be replaced with an expression of type " ^ typ
