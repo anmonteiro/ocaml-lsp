@@ -59,22 +59,35 @@ let divergent_suffix_configurations =
 
 let legacy_config = list (directives ())
 
-let preprocessed_configurations ?(include_native = false) () =
+let preprocessed_configuration mode ~is_default =
   let executable = Sys.getenv "FAKE_OCAML_MERLIN_EXE" |> Filename.quote in
-  let directives mode =
-    directives ~preprocess:(Printf.sprintf "%s --pp %s" executable mode) ()
-  in
+  let preprocess = Printf.sprintf "%s --pp %s" executable mode in
+  configuration ~mode ~is_default (directives ~preprocess ())
+;;
+
+let preprocessed_configurations ?(include_native = false) () =
   let values =
-    [ configuration ~mode:"ocaml" ~is_default:true (directives "ocaml")
-    ; configuration ~mode:"melange" ~is_default:false (directives "melange")
+    [ preprocessed_configuration "ocaml" ~is_default:true
+    ; preprocessed_configuration "melange" ~is_default:false
     ]
   in
   let values =
     if include_native
-    then values @ [ configuration ~mode:"native" ~is_default:false (directives "native") ]
+    then values @ [ preprocessed_configuration "native" ~is_default:false ]
     else values
   in
   configurations values
+;;
+
+let reversed_preprocessed_configurations () =
+  configurations
+    [ preprocessed_configuration "melange" ~is_default:false
+    ; preprocessed_configuration "ocaml" ~is_default:true
+    ]
+;;
+
+let extended_preprocessed_configuration () =
+  configurations [ preprocessed_configuration "extended" ~is_default:true ]
 ;;
 
 let exclusive_preprocessed_configuration () =
@@ -138,6 +151,8 @@ let protocol =
   | Some "error" -> `Error
   | Some "by-path" -> `By_path
   | Some "preprocessed" -> `Preprocessed
+  | Some "reversed-preprocessed" -> `Reversed_preprocessed
+  | Some "extended-preprocessed" -> `Extended_preprocessed
   | Some "slow-preprocessed" -> `Slow_preprocessed
   | Some "three-preprocessed" -> `Three_preprocessed
   | Some "divergent-suffixes" -> `Divergent_suffixes
@@ -159,6 +174,8 @@ let response_for_path path =
     let mode = Filename.basename path |> Filename.remove_extension in
     configurations [ configuration ~mode ~is_default:true (directives ()) ]
   | `Preprocessed | `Slow_preprocessed -> preprocessed_configurations ()
+  | `Reversed_preprocessed -> reversed_preprocessed_configurations ()
+  | `Extended_preprocessed -> extended_preprocessed_configuration ()
   | `Three_preprocessed -> preprocessed_configurations ~include_native:true ()
   | `Divergent_suffixes -> divergent_suffix_configurations
   | `Counterparts -> counterpart_configurations path
@@ -244,46 +261,49 @@ let preprocess mode path =
   log_preprocess mode;
   if protocol = `Slow_preprocessed && String.equal mode "melange" then Unix.sleepf 5.0;
   let input = In_channel.with_open_bin path In_channel.input_all in
-  let mode_replacements =
-    match mode with
-    | "ocaml" ->
-      [ "MODE_EXPR", "1"
-      ; "MODE_NAME", "ocamlOnly"
-      ; "MODE_LAMBDA________________", "fun a b -> a + b"
-      ; "MODE_CALL__________________", "apply 1"
-      ; "OCAML_ON", ""
-      ; "OCAML_OFF", ""
-      ; "MELANGE_ON", "(*"
-      ; "MELANGE_OFF", "*)"
-      ]
-    | "melange" ->
-      [ "MODE_EXPR", "\"text\""
-      ; "MODE_NAME", "melanOnly"
-      ; "MODE_LAMBDA________________", "fun x a b -> x + a + b"
-      ; "MODE_CALL__________________", "apply 0 1"
-      ; "OCAML_ON", "(*"
-      ; "OCAML_OFF", "*)"
-      ; "MELANGE_ON", ""
-      ; "MELANGE_OFF", ""
-      ]
-    | "native" ->
-      [ "MODE_EXPR", "true"
-      ; "MODE_NAME", "nativeOne"
-      ; "MODE_LAMBDA________________", "fun a b -> a + b"
-      ; "MODE_CALL__________________", "apply 1"
-      ; "OCAML_ON", ""
-      ; "OCAML_OFF", ""
-      ; "MELANGE_ON", ""
-      ; "MELANGE_OFF", ""
-      ]
-    | mode -> invalid_arg ("unknown preprocessing mode: " ^ mode)
-  in
-  List.fold_left
-    (fun source (pattern, replacement) ->
-       replace_all source ~pattern ~replacement:(padded pattern replacement))
-    input
-    mode_replacements
-  |> print_string
+  if String.equal mode "extended"
+  then print_string (input ^ "\nlet =")
+  else (
+    let mode_replacements =
+      match mode with
+      | "ocaml" ->
+        [ "MODE_EXPR", "1"
+        ; "MODE_NAME", "ocamlOnly"
+        ; "MODE_LAMBDA________________", "fun a b -> a + b"
+        ; "MODE_CALL__________________", "apply 1"
+        ; "OCAML_ON", ""
+        ; "OCAML_OFF", ""
+        ; "MELANGE_ON", "(*"
+        ; "MELANGE_OFF", "*)"
+        ]
+      | "melange" ->
+        [ "MODE_EXPR", "\"text\""
+        ; "MODE_NAME", "melanOnly"
+        ; "MODE_LAMBDA________________", "fun x a b -> x + a + b"
+        ; "MODE_CALL__________________", "apply 0 1"
+        ; "OCAML_ON", "(*"
+        ; "OCAML_OFF", "*)"
+        ; "MELANGE_ON", ""
+        ; "MELANGE_OFF", ""
+        ]
+      | "native" ->
+        [ "MODE_EXPR", "true"
+        ; "MODE_NAME", "nativeOne"
+        ; "MODE_LAMBDA________________", "fun a b -> a + b"
+        ; "MODE_CALL__________________", "apply 1"
+        ; "OCAML_ON", ""
+        ; "OCAML_OFF", ""
+        ; "MELANGE_ON", ""
+        ; "MELANGE_OFF", ""
+        ]
+      | mode -> invalid_arg ("unknown preprocessing mode: " ^ mode)
+    in
+    List.fold_left
+      (fun source (pattern, replacement) ->
+         replace_all source ~pattern ~replacement:(padded pattern replacement))
+      input
+      mode_replacements
+    |> print_string)
 ;;
 
 let () =

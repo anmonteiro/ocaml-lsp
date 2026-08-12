@@ -268,11 +268,12 @@ let consensus_actions configured =
       else consensus_action (action :: List.filter_opt matches))
 ;;
 
-let compute_configured_code_actions params state doc =
-  let merlin = Document.merlin_exn doc in
-  let* { Document.Merlin.configurations; _ } =
-    Document.Merlin.configuration_context_exn merlin
-  in
+let compute_configured_code_actions
+      params
+      state
+      doc
+      ({ Document.Merlin.configurations; _ } : Document.Merlin.configuration_context)
+  =
   let rec loop results = function
     | [] -> Fiber.return (List.rev results)
     | configuration :: rest ->
@@ -332,33 +333,46 @@ let compute server (params : CodeActionParams.t) =
   | Some doc ->
     let client_capabilities = State.client_capabilities state in
     let capabilities = Capabilities.show_document client_capabilities in
-    let* open_related =
-      if kind_is_requested Action_open_related.kind
-      then (
-        let can_create_file =
-          Capabilities.workspace_edit_resource_operation
-            client_capabilities
-            ~operation:ResourceOperationKind.Create
-        in
-        Action_open_related.for_uri ~can_create_file capabilities doc)
-      else Fiber.return []
+    let can_create_file =
+      Capabilities.workspace_edit_resource_operation
+        client_capabilities
+        ~operation:ResourceOperationKind.Create
     in
     let open_dune =
       if kind_is_requested Action_open_dune.kind
       then Action_open_dune.for_uri capabilities uri
       else []
     in
-    (match Document.syntax doc with
-     | Ocamllex | Menhir | Cram | Dune ->
+    (match Document.kind doc with
+     | `Other ->
+       let* open_related =
+         if kind_is_requested Action_open_related.kind
+         then Action_open_related.for_uri ~can_create_file capabilities doc None
+         else Fiber.return []
+       in
        Fiber.return (Reply.now (actions (dune_actions @ open_related @ open_dune)), state)
-     | Ocaml | Reason | Mlx ->
+     | `Merlin merlin ->
+       let* configuration_context = Document.Merlin.configuration_context_exn merlin in
+       let* open_related =
+         if kind_is_requested Action_open_related.kind
+         then
+           Action_open_related.for_uri
+             ~can_create_file
+             capabilities
+             doc
+             (Some (merlin, configuration_context))
+         else Fiber.return []
+       in
        let* merlin_jumps =
          match state.configuration.data.merlin_jump_code_actions with
-         | Some { enable = true } -> Action_jump.code_actions doc params capabilities
+         | Some { enable = true } ->
+           Action_jump.code_actions doc configuration_context params capabilities
          | Some { enable = false } | None -> Fiber.return []
        in
        let reply () =
-         let+ code_action_results = compute_configured_code_actions params state doc in
+         let+ code_action_results =
+           compute_configured_code_actions params state doc configuration_context
+         in
          List.concat
            [ code_action_results; dune_actions; open_related; open_dune; merlin_jumps ]
          |> actions

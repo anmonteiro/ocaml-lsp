@@ -9,4 +9,5 @@ val for_uri
   :  can_create_file:bool
   -> ShowDocumentClientCapabilities.t option
   -> Document.t
+  -> (Document.Merlin.t * Document.Merlin.configuration_context) option
   -> CodeAction.t list Fiber.t
