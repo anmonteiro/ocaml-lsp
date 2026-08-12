@@ -32,19 +32,25 @@ let available (capabilities : ShowDocumentClientCapabilities.t option) =
   | Some { support = true } -> true
 ;;
 
-let for_uri ~can_create_file (capabilities : ShowDocumentClientCapabilities.t option) doc =
+let for_uri
+      ~can_create_file
+      (capabilities : ShowDocumentClientCapabilities.t option)
+      doc
+      configuration_context
+  =
   let uri = Document.uri doc in
   match available capabilities, Document.syntax doc with
   | false, _ | true, (Dune | Cram) -> Fiber.return []
   | true, (Ocaml | Reason | Ocamllex | Menhir | Mlx) ->
     let* counterparts =
-      match Document.kind doc with
-      | `Other -> Fiber.return (Document.get_impl_intf_counterparts None uri)
-      | `Merlin merlin ->
-        let+ { Document.Merlin.configurations; _ } =
-          Document.Merlin.configuration_context_exn merlin
-        in
-        Document.get_impl_intf_counterparts_for_configurations merlin configurations uri
+      match configuration_context with
+      | None -> Fiber.return (Document.get_impl_intf_counterparts None uri)
+      | Some (merlin, { Document.Merlin.configurations; _ }) ->
+        Fiber.return
+          (Document.get_impl_intf_counterparts_for_configurations
+             merlin
+             configurations
+             uri)
     in
     let actions =
       List.filter_map counterparts ~f:(fun uri ->

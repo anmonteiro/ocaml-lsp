@@ -548,6 +548,7 @@ let close t =
 ;;
 
 let get_impl_intf_counterparts m uri =
+  let uri = Source_path.uri uri in
   let fpath = Uri.to_path uri in
   let fname = Filename.basename fpath in
   let ml, mli, eliom, eliomi, re, rei, mll, mly, mlx =
@@ -594,10 +595,11 @@ let get_impl_intf_counterparts m uri =
       [ switch_to_fpath ]
     | to_switch_to -> to_switch_to
   in
-  List.map ~f:Uri.of_path files_to_switch_to
+  List.map ~f:Source_path.of_path files_to_switch_to
 ;;
 
 let get_impl_intf_counterparts_for_configurations merlin configurations uri =
+  let uri = Source_path.uri uri in
   let configured = Merlin_config.configuration_list configurations in
   if
     List.for_all configured ~f:(fun configuration ->

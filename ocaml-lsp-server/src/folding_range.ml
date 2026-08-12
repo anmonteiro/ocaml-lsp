@@ -376,8 +376,8 @@ let compute (state : State.t) (params : FoldingRangeParams.t) =
       let ranges =
         (* [rangeLimit] is a hint, so returning fewer ranges is allowed. *)
         match config.range_limit with
-        | Some limit when limit < List.length ranges -> List.take ranges limit
-        | Some _ | None -> ranges
+        | None -> ranges
+        | Some range_limit -> List.take ranges (Int.max range_limit 0)
       in
       Some ranges)
 ;;

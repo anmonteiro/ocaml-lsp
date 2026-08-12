@@ -576,6 +576,17 @@ let complete (state : State.t) (params : CompletionParams.t) =
             | Ok (Items items) -> configuration, items
             | Ok Suppressed | Error _ -> assert false)
         in
+        let primary = Merlin_config.primary configurations in
+        let primary_items, other_items =
+          List.partition_tf configured_items ~f:(fun (configuration, _) ->
+            configuration == primary)
+        in
+        let configured_items =
+          match primary_items with
+          | [ primary_items ] -> primary_items :: other_items
+          | [] | _ :: _ :: _ ->
+            invalid_arg "Compl.complete: missing primary configuration"
+        in
         let items = intersect_items configured_items in
         let items =
           if capabilities.resolve

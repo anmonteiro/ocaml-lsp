@@ -202,8 +202,16 @@ let get_semantic_tokens_cache
   =
   fun t uri ~resultId ->
   let doc = get' t uri in
-  List.find !doc.semantic_tokens_cache ~f:(fun cached ->
-    String.equal cached.resultId resultId)
+  let rec find previous = function
+    | [] -> None
+    | cached :: rest ->
+      if String.equal cached.resultId resultId
+      then (
+        !doc.semantic_tokens_cache <- cached :: List.rev_append previous rest;
+        Some cached)
+      else find (cached :: previous) rest
+  in
+  find [] !doc.semantic_tokens_cache
 ;;
 
 let parallel_iter t ~f =

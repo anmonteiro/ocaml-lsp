@@ -339,6 +339,50 @@ let apply_semantic_token_edit
     ]
 ;;
 
+let%expect_test "semantic token result IDs are retained by recent use" =
+  let on_notification, _ = Test.drain_diagnostics () in
+  let handler = Client.Handler.make ~on_notification () in
+  (Test.run_initialized ~handler ~capabilities:client_capabilities
+   @@ fun client ->
+   let uri = Helpers.uri in
+   let source = "let value = 1\n" in
+   let* () = Test.open_document ~client ~uri ~source () in
+   let textDocument = TextDocumentIdentifier.create ~uri in
+   let full () =
+     let+ response =
+       Client.request
+         client
+         (SemanticTokensFull (SemanticTokensParams.create ~textDocument ()))
+     in
+     match response with
+     | Some { SemanticTokens.resultId = Some result_id; _ } -> result_id
+     | None | Some { resultId = None; _ } -> failwith "full response has no result id"
+   in
+   let delta previousResultId =
+     Client.request
+       client
+       (SemanticTokensDelta
+          (SemanticTokensDeltaParams.create ~previousResultId ~textDocument ()))
+   in
+   let print_response label = function
+     | Some (`SemanticTokensDelta _) -> Printf.printf "%s: delta\n" label
+     | Some (`SemanticTokens _) -> Printf.printf "%s: full\n" label
+     | None -> Printf.printf "%s: none\n" label
+   in
+   let* first = full () in
+   let* (_ : string) = full () in
+   let* first_use = delta first in
+   let* second_use = delta first in
+   print_response "first use" first_use;
+   print_response "second use" second_use;
+   Test.exit_client client);
+  [%expect
+    {|
+    first use: delta
+    second use: delta
+    |}]
+;;
+
 let%expect_test "semantic token deltas reconstruct a fresh full response" =
   let on_notification, diagnostics = Test.drain_diagnostics () in
   let handler = Client.Handler.make ~on_notification () in
