@@ -62,6 +62,26 @@ let%expect_test "returns folding ranges for `let`" =
     |}]
 ;;
 
+let%expect_test "honors the client folding range limit" =
+  let source =
+    {folding_range|let a =
+  let b = 1
+  in
+  let c =
+    "foo"
+  in
+  ()|folding_range}
+  in
+  let foldingRange = FoldingRangeClientCapabilities.create ~rangeLimit:1 () in
+  let textDocument = TextDocumentClientCapabilities.create ~foldingRange () in
+  let capabilities = ClientCapabilities.create ~textDocument () in
+  Helpers.test ~capabilities source (fun client ->
+    let+ response = folding_range client in
+    let count = Option.value response ~default:[] |> List.length in
+    Printf.printf "folding ranges: %d\n" count);
+  [%expect {| folding ranges: 1 |}]
+;;
+
 let%expect_test "returns folding ranges for open expressions" =
   let source =
     {folding_range|open struct

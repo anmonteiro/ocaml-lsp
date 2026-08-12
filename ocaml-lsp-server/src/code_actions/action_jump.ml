@@ -58,8 +58,73 @@ let process_jump_request ~merlin ~position ~target =
   | `Found pos -> Some pos
 ;;
 
+type jump =
+  { configuration : Merlin_config.configuration
+  ; target : string
+  ; uri : Uri.t
+  ; range : Range.t
+  }
+
+type jump_group =
+  { configurations : Merlin_config.configuration list
+  ; uri : Uri.t
+  ; range : Range.t
+  }
+
+let reraise_cancellation errors =
+  List.find errors ~f:(fun { Exn_with_backtrace.exn; _ } ->
+    match exn with
+    | Jsonrpc.Response.Error.E { code = RequestCancelled; _ } -> true
+    | _ -> false)
+  |> Option.iter ~f:Exn_with_backtrace.reraise
+;;
+
+let log_failures configuration errors =
+  List.iter errors ~f:(fun error ->
+    Log.log ~section:"code-actions" (fun () ->
+      Log.msg
+        "Configured Merlin jump computation failed"
+        [ "mode", `String (Merlin_config.configuration_label configuration)
+        ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+        ]))
+;;
+
+let group_jumps jumps =
+  List.fold_left jumps ~init:[] ~f:(fun groups jump ->
+    let rec add = function
+      | [] ->
+        [ { configurations = [ jump.configuration ]; uri = jump.uri; range = jump.range }
+        ]
+      | group :: rest ->
+        if Uri.equal group.uri jump.uri && Poly.equal group.range jump.range
+        then
+          { group with configurations = group.configurations @ [ jump.configuration ] }
+          :: rest
+        else group :: add rest
+    in
+    add groups)
+;;
+
+let action_of_group ~label_modes target group =
+  let base_title = sprintf "%s jump" (String.capitalize (rename_target target)) in
+  let title =
+    if label_modes
+    then
+      sprintf
+        "%s (%s)"
+        base_title
+        (List.map group.configurations ~f:Merlin_config.configuration_label
+         |> String.concat ~sep:", ")
+    else base_title
+  in
+  let arguments = [ DocumentUri.yojson_of_t group.uri; Range.yojson_of_t group.range ] in
+  let command = Command.create ~title ~command:command_name ~arguments () in
+  CodeAction.create ~title ~kind:(kind target) ~command ()
+;;
+
 let code_actions
       (doc : Document.t)
+      ({ Document.Merlin.configurations; _ } : Document.Merlin.configuration_context)
       (params : CodeActionParams.t)
       (capabilities : ShowDocumentClientCapabilities.t option)
   =
@@ -67,33 +132,51 @@ let code_actions
     List.filter targets ~f:(fun target ->
       Lsp.Code_action.kind_is_requested params.context.only (kind target))
   in
-  match Document.kind doc, targets with
-  | `Merlin merlin, _ :: _ when available capabilities ->
-    let* { Document.Merlin.configurations; _ } =
-      Document.Merlin.configuration_context_exn merlin
+  match targets with
+  | _ :: _ when available capabilities ->
+    let configurations = Merlin_config.configuration_list configurations in
+    let uri = Document.uri doc |> Source_path.uri in
+    let rec collect acc = function
+      | [] -> Fiber.return (List.rev acc)
+      | configuration :: rest ->
+        let configured_doc = Document.with_merlin_configuration doc configuration in
+        let configured_merlin = Document.merlin_exn configured_doc in
+        let* result =
+          Fiber.collect_errors (fun () ->
+            Fiber.parallel_map targets ~f:(fun target ->
+              let+ result =
+                process_jump_request
+                  ~merlin:configured_merlin
+                  ~position:params.range.start
+                  ~target
+              in
+              let open Option.O in
+              let* lexing_position = result in
+              let+ position = Position.of_lexical_position lexing_position in
+              let range = { Range.start = position; end_ = position } in
+              { configuration; target; uri; range }))
+        in
+        let jumps =
+          match result with
+          | Ok jumps -> List.filter_opt jumps
+          | Error errors ->
+            reraise_cancellation errors;
+            log_failures configuration errors;
+            []
+        in
+        collect (List.rev_append jumps acc) rest
     in
-    (match Merlin_config.configuration_list configurations with
-     | [ configuration ] ->
-       let doc = Document.with_merlin_configuration doc configuration in
-       let merlin = Document.merlin_exn doc in
-       let+ actions =
-         (* TODO: Merlin Jump command that returns all available jump locations for a source code buffer. *)
-         Fiber.parallel_map targets ~f:(fun target ->
-           let+ res = process_jump_request ~merlin ~position:params.range.start ~target in
-           let open Option.O in
-           let* lexing_pos = res in
-           let+ position = Position.of_lexical_position lexing_pos in
-           let uri = Document.uri doc in
-           let range = { Range.start = position; end_ = position } in
-           let title = sprintf "%s jump" (String.capitalize (rename_target target)) in
-           let command =
-             let arguments = [ DocumentUri.yojson_of_t uri; Range.yojson_of_t range ] in
-             Command.create ~title ~command:command_name ~arguments ()
-           in
-           CodeAction.create ~title ~kind:(kind target) ~command ())
-       in
-       List.filter_opt actions
-     | _ :: _ :: _ -> Fiber.return []
-     | [] -> invalid_arg "Action_jump.code_actions")
+    let+ jumps = collect [] configurations in
+    List.concat_map targets ~f:(fun target ->
+      let groups =
+        List.filter jumps ~f:(fun jump -> String.equal jump.target target) |> group_jumps
+      in
+      let configuration_count = List.length configurations in
+      let divergent = List.length groups > 1 in
+      List.map groups ~f:(fun group ->
+        let label_modes =
+          divergent || List.length group.configurations <> configuration_count
+        in
+        action_of_group ~label_modes target group))
   | _ -> Fiber.return []
 ;;

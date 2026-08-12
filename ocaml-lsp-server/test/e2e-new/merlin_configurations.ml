@@ -61,6 +61,12 @@ let has_completion items label =
   List.exists items ~f:(fun (item : CompletionItem.t) -> String.equal item.label label)
 ;;
 
+let code_action_capabilities () =
+  let showDocument = ShowDocumentClientCapabilities.create ~support:true in
+  let window = WindowClientCapabilities.create ~showDocument () in
+  ClientCapabilities.create ~window ()
+;;
+
 let rename client ~position ~newName =
   let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
   Client.request
@@ -277,6 +283,30 @@ let%expect_test "diagnostics retain mode contributors" =
     |}]
 ;;
 
+let%expect_test "generated diagnostic locations are not clamped to the source" =
+  let diagnostics = Fiber.Ivar.create () in
+  let handler =
+    Client.Handler.make
+      ~on_notification:(fun _ -> function
+         | PublishDiagnostics params -> Fiber.Ivar.fill diagnostics params
+         | _ -> Fiber.return ())
+      ()
+  in
+  (Test.run_initialized ~handler ~extra_env:(extra_env "extended-preprocessed")
+   @@ fun client ->
+   let* () = Test.open_document ~client ~uri:Helpers.uri ~source:"let value = 1" () in
+   let* { PublishDiagnosticsParams.diagnostics = published; _ } =
+     Fiber.Ivar.read diagnostics
+   in
+   let generated_location_retained =
+     List.exists published ~f:(fun { Diagnostic.range = { Range.start; _ }; _ } ->
+       start.line > 0)
+   in
+   Printf.printf "generated location retained: %b\n" generated_location_retained;
+   Test.exit_client client);
+  [%expect {| generated location retained: true |}]
+;;
+
 let%expect_test "completion intersects modes and honors comment suppression" =
   let source = "let shared = 1\nlet MODE_NAME = 2\nlet _ = \nOCAML_ON List. OCAML_OFF" in
   Helpers.test ~extra_env:(extra_env "preprocessed") source (fun client ->
@@ -318,6 +348,29 @@ let%expect_test "completion intersects modes and honors comment suppression" =
     melange-only: false
     suppressed: true
     |}]
+;;
+
+let%expect_test "completion uses the declared default as its primary configuration" =
+  let source = "let value = MODE_EXPR\nlet _ = val" in
+  Helpers.test ~extra_env:(extra_env "reversed-preprocessed") source (fun client ->
+    let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+    let+ response =
+      Client.request
+        client
+        (TextDocumentCompletion
+           (CompletionParams.create
+              ~textDocument
+              ~position:(Position.create ~line:1 ~character:11)
+              ()))
+    in
+    let item =
+      completion_items response
+      |> List.find ~f:(fun (item : CompletionItem.t) -> String.equal item.label "value")
+      |> Option.value_exn
+    in
+    let detail = Option.value item.detail ~default:"" in
+    Printf.printf "default detail first: %b\n" (String.is_prefix detail ~prefix:"OCaml:"));
+  [%expect {| default detail first: true |}]
 ;;
 
 let%expect_test "hover preserves divergent mode results" =
@@ -578,6 +631,145 @@ let%expect_test "code actions filter diagnostic provenance by wire mode key" =
     |}]
 ;;
 
+let%expect_test "a code-action request fetches its configuration set once" =
+  let dir = Test.temp_dir "code-action-configuration-snapshot" in
+  let log = Filename.concat dir "requests.log" in
+  Test.write_file log "";
+  let extra_env = ("FAKE_OCAML_MERLIN_LOG=" ^ log) :: extra_env "plural" in
+  let on_notification, _ = Test.drain_diagnostics () in
+  let handler = Client.Handler.make ~on_notification () in
+  (Test.run_initialized ~handler ~capabilities:(code_action_capabilities ()) ~extra_env
+   @@ fun client ->
+   let settings =
+     `Assoc
+       [ "diagnostics_delay", `Float 10.0
+       ; "merlinJumpCodeActions", `Assoc [ "enable", `Bool true ]
+       ]
+   in
+   let* () = Client.notification client (ChangeConfiguration { settings }) in
+   let source = "let value = 1" in
+   let* () = Test.open_document ~client ~uri:Helpers.uri ~source () in
+   Test.write_file log "";
+   let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+   let context =
+     CodeActionContext.create
+       ~diagnostics:[]
+       ~only:
+         [ CodeActionKind.Other "switch"
+         ; CodeActionKind.Other "merlin-jump-let"
+         ; CodeActionKind.Other "type-annotate"
+         ]
+       ()
+   in
+   let position = Position.create ~line:0 ~character:4 in
+   let range = Range.create ~start:position ~end_:position in
+   let* (_ : [ `CodeAction of CodeAction.t | `Command of Command.t ] list option) =
+     Client.request
+       client
+       (CodeAction (CodeActionParams.create ~textDocument ~range ~context ()))
+   in
+   let request_count =
+     In_channel.with_open_text log In_channel.input_all
+     |> String.split_lines
+     |> List.count ~f:(String.is_substring ~substring:"File-Configurations")
+   in
+   Printf.printf "configuration requests: %d\n" request_count;
+   Test.exit_client client);
+  [%expect {| configuration requests: 1 |}]
+;;
+
+let request_fun_jump client ~uri ~position =
+  let settings = `Assoc [ "merlinJumpCodeActions", `Assoc [ "enable", `Bool true ] ] in
+  let* () = Client.notification client (ChangeConfiguration { settings }) in
+  let textDocument = TextDocumentIdentifier.create ~uri in
+  let context =
+    CodeActionContext.create
+      ~diagnostics:[]
+      ~only:[ CodeActionKind.Other "merlin-jump-fun" ]
+      ()
+  in
+  let range = Range.create ~start:position ~end_:position in
+  Client.request
+    client
+    (CodeAction (CodeActionParams.create ~textDocument ~range ~context ()))
+;;
+
+let print_fun_jumps = function
+  | None -> print_endline "<none>"
+  | Some actions ->
+    List.iter actions ~f:(function
+      | `Command _ -> ()
+      | `CodeAction
+          { CodeAction.title; command = Some { arguments = Some arguments; _ }; _ } ->
+        (match arguments with
+         | [ _; range ] ->
+           let { Range.start; _ } = Range.t_of_yojson range in
+           Printf.printf "%s: %d\n" title start.line
+         | _ -> ())
+      | `CodeAction _ -> ())
+;;
+
+let%expect_test "Merlin jump actions union and label mode-specific targets" =
+  let run source position =
+    Helpers.test
+      ~capabilities:(code_action_capabilities ())
+      ~extra_env:(extra_env "preprocessed")
+      source
+      (fun client ->
+         let+ actions = request_fun_jump client ~uri:Helpers.uri ~position in
+         print_fun_jumps actions)
+  in
+  run "let result = (fun () ->\n  1) ()" (Position.create ~line:1 ~character:2);
+  run
+    (String.concat
+       ~sep:"\n"
+       [ "OCAML_ON let result = (fun () -> OCAML_OFF"
+       ; "MELANGE_ON let result = (fun _ -> MELANGE_OFF"
+       ; "  1"
+       ; "OCAML_ON ) () OCAML_OFF"
+       ; "MELANGE_ON ) 0 MELANGE_OFF"
+       ])
+    (Position.create ~line:2 ~character:2);
+  [%expect
+    {|
+    Fun jump: 0
+    Fun jump (OCaml): 0
+    Fun jump (Melange): 1
+    |}]
+;;
+
+let%expect_test "Merlin jump commands canonicalize a symlinked document" =
+  let dir = Test.temp_dir "jump-symlink" in
+  let source = "let result = (fun () ->\n  1) ()" in
+  let original = Filename.concat dir "original.ml" in
+  let link = Filename.concat dir "link.ml" in
+  Test.write_file original source;
+  Unix.symlink original link;
+  let uri = DocumentUri.of_path link in
+  Helpers.test
+    ~uri
+    ~capabilities:(code_action_capabilities ())
+    ~extra_env:(extra_env "preprocessed")
+    source
+    (fun client ->
+       let+ actions =
+         request_fun_jump client ~uri ~position:(Position.create ~line:1 ~character:2)
+       in
+       let command_uri =
+         Option.value_exn actions
+         |> List.find_map ~f:(function
+           | `CodeAction
+               { CodeAction.command = Some { arguments = Some (uri :: _); _ }; _ } ->
+             Some (DocumentUri.t_of_yojson uri)
+           | `Command _ | `CodeAction _ -> None)
+         |> Option.value_exn
+       in
+       Printf.printf
+         "canonical command URI: %b\n"
+         (String.equal (DocumentUri.to_path command_uri) (Unix.realpath original)));
+  [%expect {| canonical command URI: true |}]
+;;
+
 let%expect_test "edit-producing custom requests reject multiple modes" =
   Helpers.test ~extra_env:(extra_env "preprocessed") source (fun client ->
     print_request_error
@@ -697,6 +889,40 @@ let%expect_test "exact counterparts are unioned by mode" =
     main.ocaml.mli
     main.melange.mli
     |}]
+;;
+
+let%expect_test "legacy counterpart lookup starts from the symlink target" =
+  let dir = Test.temp_dir "counterpart-symlink" in
+  let original = Filename.concat dir "original.ml" in
+  let interface = Filename.concat dir "original.mli" in
+  let link = Filename.concat dir "link.ml" in
+  Test.write_file original source;
+  Test.write_file interface "val value : int\n";
+  Unix.symlink original link;
+  let uri = DocumentUri.of_path link in
+  let on_notification, _ = Test.drain_diagnostics () in
+  let handler = Client.Handler.make ~on_notification () in
+  (Test.run_initialized ~handler ~extra_env:(extra_env ~root:dir "legacy")
+   @@ fun client ->
+   let* () = Test.open_document ~client ~uri ~source () in
+   let* response =
+     Test.custom_request
+       client
+       "ocamllsp/switchImplIntf"
+       (`List [ DocumentUri.yojson_of_t uri ])
+   in
+   let counterpart =
+     Yojson.Safe.Util.to_list response
+     |> List.map ~f:Yojson.Safe.Util.to_string
+     |> List.hd_exn
+     |> DocumentUri.of_string
+     |> DocumentUri.to_path
+   in
+   Printf.printf
+     "original interface: %b\n"
+     (String.equal counterpart (Unix.realpath interface));
+   Test.exit_client client);
+  [%expect {| original interface: true |}]
 ;;
 
 let%expect_test "cross-document edits pair exact counterparts by mode" =
