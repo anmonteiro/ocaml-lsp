@@ -451,6 +451,48 @@ let%expect_test "signature help preserves mode-specific active parameters" =
     |}]
 ;;
 
+let%expect_test "document symbols preserve mode-specific type details" =
+  let capabilities =
+    let documentSymbol =
+      DocumentSymbolClientCapabilities.create ~hierarchicalDocumentSymbolSupport:true ()
+    in
+    let textDocument = TextDocumentClientCapabilities.create ~documentSymbol () in
+    ClientCapabilities.create ~textDocument ()
+  in
+  Helpers.test
+    ~capabilities
+    ~extra_env:(extra_env "preprocessed")
+    "let shared = 1\nlet value = MODE_SYMBOL_EXPR"
+    (fun client ->
+       let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+       let params = DocumentSymbolParams.create ~textDocument () in
+       let+ response = Client.request client (Lsp.Client_request.DocumentSymbol params) in
+       let symbols =
+         match response with
+         | Some (`DocumentSymbol symbols) -> symbols
+         | Some (`SymbolInformation _) | None -> failwith "missing document symbols"
+       in
+       let find_symbol name =
+         List.find_exn symbols ~f:(fun (symbol : DocumentSymbol.t) ->
+           String.equal symbol.name name)
+       in
+       Printf.printf "symbols: %d\n" (List.length symbols);
+       Printf.printf
+         "shared detail: %s\n"
+         (Option.value (find_symbol "shared").detail ~default:"<none>");
+       Printf.printf
+         "divergent detail:\n%s\n"
+         (Option.value_exn (find_symbol "value").detail));
+  [%expect
+    {|
+    symbols: 2
+    shared detail: <none>
+    divergent detail:
+    OCaml: int
+    Melange: string
+    |}]
+;;
+
 let%expect_test "semantic tokens intersect mode-specific regions" =
   let source =
     "let shared = 1\nOCAML_ON let ocaml_only = shared OCAML_OFF\nlet use = shared"
