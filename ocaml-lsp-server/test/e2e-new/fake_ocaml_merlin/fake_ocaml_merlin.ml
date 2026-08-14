@@ -268,6 +268,7 @@ let preprocess mode path =
       match mode with
       | "ocaml" ->
         [ "MODE_EXPR", "1"
+        ; "MODE_SYMBOL_EXPR", "123456"
         ; "MODE_NAME", "ocamlOnly"
         ; "MODE_LAMBDA________________", "fun a b -> a + b"
         ; "MODE_CALL__________________", "apply 1"
@@ -278,6 +279,7 @@ let preprocess mode path =
         ]
       | "melange" ->
         [ "MODE_EXPR", "\"text\""
+        ; "MODE_SYMBOL_EXPR", "\"text\""
         ; "MODE_NAME", "melanOnly"
         ; "MODE_LAMBDA________________", "fun x a b -> x + a + b"
         ; "MODE_CALL__________________", "apply 0 1"
@@ -288,6 +290,7 @@ let preprocess mode path =
         ]
       | "native" ->
         [ "MODE_EXPR", "true"
+        ; "MODE_SYMBOL_EXPR", "(true)"
         ; "MODE_NAME", "nativeOne"
         ; "MODE_LAMBDA________________", "fun a b -> a + b"
         ; "MODE_CALL__________________", "apply 1"
