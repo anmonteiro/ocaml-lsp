@@ -586,7 +586,7 @@ let destroy t = Fiber.Mutex.with_lock t.mutex ~f:(fun () -> destroy_unlocked t)
 let create db path =
   let path =
     let path = Uri.to_path path in
-    Misc.canonicalize_filename path
+    Source_path.canonicalize path
   in
   let directory = Filename.dirname path in
   let initial =
