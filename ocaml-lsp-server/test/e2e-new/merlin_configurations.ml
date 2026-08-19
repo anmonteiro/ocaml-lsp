@@ -212,6 +212,24 @@ let%expect_test "concurrent documents receive their own response" =
     |}]
 ;;
 
+let%expect_test "configuration lookup canonicalizes a symlinked document" =
+  let dir = Test.temp_dir "configuration-symlink" in
+  let original = Filename.concat dir "original.ml" in
+  let link = Filename.concat dir "link.ml" in
+  Test.write_file original source;
+  Unix.symlink original link;
+  let uri = DocumentUri.of_path link in
+  let on_notification, _ = Test.drain_diagnostics () in
+  let handler = Client.Handler.make ~on_notification () in
+  (Test.run_initialized ~cwd:dir ~handler ~extra_env:(extra_env ~root:dir "by-path")
+   @@ fun client ->
+   let* () = Test.open_document ~client ~uri ~source () in
+   let* response = request client uri in
+   Test.print_result response;
+   Test.exit_client client);
+  [%expect {| [ { "mode": "original", "isDefault": true } ] |}]
+;;
+
 let%expect_test "exclusive files execute only their applicable mode" =
   let dir = Test.temp_dir "exclusive-mode" in
   let log = Filename.concat dir "preprocess.log" in
