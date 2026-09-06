@@ -42,7 +42,7 @@ let dispatch merlin (range : Range.t) =
 module Range_key = struct
   type t = Range.t
 
-  let compare = Lsp.Range.compare
+  let compare = Range.compare
   let hash = Poly.hash
   let sexp_of_t = Sexplib0.Sexp_conv.sexp_of_opaque
 end
@@ -53,15 +53,15 @@ let cached_dispatch merlin =
 ;;
 
 let run state doc ~(dispatch : dispatch) ~action_kind ~(range : Range.t) ~postprocess =
-  let+ res = dispatch range in
-  match res with
+  dispatch range
+  >>| function
   | Ok reply ->
-    let reply = postprocess reply in
-    let supportsJumpToNextHole =
-      State.experimental_client_capabilities state
-      |> Client.Experimental_capabilities.supportsJumpToNextHole
-    in
-    Some (code_action_of_case_analysis ~action_kind ~supportsJumpToNextHole doc reply)
+    postprocess reply
+    |> Option.map ~f:(fun reply ->
+      let supportsJumpToNextHole =
+        Experimental.bool (State.experimental_client_capabilities state) "jumpToNextHole"
+      in
+      code_action_of_case_analysis ~action_kind ~supportsJumpToNextHole doc reply)
   | Error
       { exn =
           ( Merlin_analysis.Destruct.Wrong_parent _
@@ -80,7 +80,7 @@ let code_action (state : State.t) dispatch doc (params : CodeActionParams.t) =
   | `Other -> Fiber.return None
   | `Merlin m when Document.Merlin.kind m = Intf -> Fiber.return None
   | `Merlin _ ->
-    run state doc ~dispatch ~action_kind ~range:params.range ~postprocess:Fun.id
+    run state doc ~dispatch ~action_kind ~range:params.range ~postprocess:Option.some
 ;;
 
 let t ~dispatch state =

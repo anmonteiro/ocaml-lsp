@@ -68,5 +68,5 @@ let on_request ~params state =
       (Option.value ~default:(`Assoc []) params :> Yojson.Safe.t)
       |> Request_params.t_of_yojson
     in
-    Util.with_pipeline state uri ~default:`Null @@ dispatch_phrase position target)
+    Util.with_primary_pipeline state uri ~default:`Null @@ dispatch_phrase position target)
 ;;

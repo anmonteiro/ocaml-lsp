@@ -6,12 +6,19 @@ type init =
       { params : InitializeParams.t
       ; workspaces : Workspaces.t
       ; dune : Dune.t
-      ; exp_client_caps : Client.Experimental_capabilities.t
+      ; exp_client_caps : Experimental.t
       ; diagnostics : Diagnostics.t
       ; position_encoding : [ `UTF16 | `UTF8 ]
       }
 
-type hover_extended = { mutable history : (Uri.t * Position.t * int) option }
+type hover_history =
+  { uri : Uri.t
+  ; position : Position.t
+  ; version : int
+  ; verbosity : int
+  }
+
+type hover_extended = { mutable history : hover_history option }
 
 type t =
   { store : Document_store.t
@@ -22,6 +29,7 @@ type t =
   ; configuration : Configuration.t
   ; trace : TraceValue.t
   ; ocamlformat_rpc : Ocamlformat_rpc.t
+  ; ocp_indent : Ocp_indent.t
   ; symbols_thread : Lev_fiber.Thread.t Lazy_fiber.t
   ; wheel : Lev_fiber.Timer.Wheel.t
   ; hover_extended : hover_extended
@@ -33,6 +41,7 @@ let create
       ~detached
       ~configuration
       ~ocamlformat_rpc
+      ~ocp_indent
       ~symbols_thread
       ~wheel
       ~trace
@@ -45,6 +54,7 @@ let create
   ; configuration
   ; trace = Off
   ; ocamlformat_rpc
+  ; ocp_indent
   ; symbols_thread
   ; wheel
   ; hover_extended = { history = None }
@@ -109,8 +119,7 @@ let initialize
         ; dune
         ; diagnostics
         ; position_encoding
-        ; exp_client_caps =
-            Client.Experimental_capabilities.of_opt_json params.capabilities.experimental
+        ; exp_client_caps = Experimental.of_opt_json params.capabilities.experimental
         }
   }
 ;;

@@ -27,10 +27,37 @@ let setup_ocamlformat content =
   tmpdir
 ;;
 
+let write_formatter bin_dir name =
+  let path = Filename.concat bin_dir name in
+  Test.write_file
+    path
+    (Printf.sprintf
+       "#!/bin/sh\n\
+        while IFS= read -r line; do :; done\n\
+        printf '%%s\\n' 'let selected = \"%s\"'\n"
+       name);
+  Unix.chmod path 0o700
+;;
+
+let workspace_folder path =
+  WorkspaceFolder.create ~uri:(DocumentUri.of_path path) ~name:(Filename.basename path)
+;;
+
 let make_request textDocument =
   let options = FormattingOptions.create ~tabSize:2 ~insertSpaces:true () in
   Lsp.Client_request.TextDocumentFormatting
     (DocumentFormattingParams.create ~textDocument ~options ())
+;;
+
+let make_range_request textDocument =
+  let options = FormattingOptions.create ~tabSize:2 ~insertSpaces:true () in
+  let range =
+    Range.create
+      ~start:(Position.create ~line:0 ~character:0)
+      ~end_:(Position.create ~line:0 ~character:25)
+  in
+  Lsp.Client_request.TextDocumentRangeFormatting
+    (DocumentRangeFormattingParams.create ~textDocument ~range ~options ())
 ;;
 
 let iter_formatting ?language_id source path =
@@ -41,18 +68,25 @@ let iter_formatting ?language_id source path =
     ~source
 ;;
 
-let print_formatting_textedits = function
+let print_formatting_textedits ?source = function
   | None -> print_endline "No formatting result"
   | Some [] -> print_endline "No formatting needed"
   | Some edits ->
-    edits
-    |> Ppx_yojson_conv_lib.Yojson_conv.yojson_of_list TextEdit.yojson_of_t
-    |> Yojson.Safe.pretty_to_string ~std:false
-    |> print_endline
+    (match source with
+     | Some source ->
+       List.iter edits ~f:(fun (edit : TextEdit.t) ->
+         Printf.printf "edit: %s\n" (Range.to_string edit.range));
+       print_endline "result:";
+       Test.apply_edits source edits |> print_string
+     | None ->
+       edits
+       |> Ppx_yojson_conv_lib.Yojson_conv.yojson_of_list TextEdit.yojson_of_t
+       |> Yojson.Safe.pretty_to_string ~std:false
+       |> print_endline)
 ;;
 
 let print_formatting ?language_id source path =
-  iter_formatting ?language_id source path print_formatting_textedits
+  iter_formatting ?language_id source path (print_formatting_textedits ~source)
 ;;
 
 let print_formatting_error ?language_id source path =
@@ -80,11 +114,19 @@ let print_request_error = function
     Fiber.return ()
 ;;
 
-let test_formatter_failure ~path_env source =
+let test_formatter_failure
+      ?(path = "/workspace/format_failure.ml")
+      ?workspace_root
+      ~path_env
+      source
+  =
   let handler = Client.Handler.make ~on_notification:(fun _ _ -> Fiber.return ()) () in
-  Test.run_initialized ~handler ~extra_env:[ "PATH=" ^ path_env ]
+  let workspaceFolders =
+    Option.map workspace_root ~f:(fun root -> [ workspace_folder root ])
+  in
+  Test.run_initialized ~handler ~extra_env:[ "PATH=" ^ path_env ] ~workspaceFolders
   @@ fun client ->
-  let uri = DocumentUri.of_path "/workspace/format_failure.ml" in
+  let uri = DocumentUri.of_path path in
   let* () = Test.open_document ~client ~uri ~source () in
   let textDocument = TextDocumentIdentifier.create ~uri in
   let* result =
@@ -103,6 +145,19 @@ let%expect_test "reports a missing ocamlformat executable" =
     |}]
 ;;
 
+let%expect_test "reports a missing configured ocp-indent executable" =
+  let dir = Test.temp_dir "ocamllsp-no-ocp-indent-" in
+  Test.write_file (Filename.concat dir ".ocp-indent") "base=4\n";
+  let empty_path = Filename.concat dir "bin" in
+  Unix.mkdir empty_path 0o700;
+  let path = Filename.concat dir "format_failure.ml" in
+  test_formatter_failure ~path ~workspace_root:dir ~path_env:empty_path "let  x=1";
+  [%expect
+    {|
+    code=InvalidRequest message=Unable to find ocp-indent binary. You need to install ocp-indent manually to use the formatting feature.
+    |}]
+;;
+
 let%expect_test "reports a nonzero ocamlformat exit" =
   let failing_path = Test.temp_dir "ocamllsp-failing-ocamlformat-" in
   let formatter = Filename.concat failing_path "ocamlformat" in
@@ -115,6 +170,172 @@ let%expect_test "reports a nonzero ocamlformat exit" =
   Unix.chmod formatter 0o700;
   test_formatter_failure ~path_env:failing_path "let  x=1";
   [%expect {| code=InternalError message=formatter exploded |}]
+;;
+
+let%expect_test "falls back to ocp-indent when ocamlformat is unavailable" =
+  let dir = Test.temp_dir "ocamllsp-ocp-indent-fallback-" in
+  let bin_dir = Filename.concat dir "bin" in
+  Unix.mkdir bin_dir 0o700;
+  write_formatter bin_dir "ocp-indent";
+  let handler = Client.Handler.make ~on_notification:(fun _ _ -> Fiber.return ()) () in
+  Test.run_initialized
+    ~handler
+    ~extra_env:[ "PATH=" ^ bin_dir ]
+    (fun client ->
+       let uri =
+         let path = Filename.concat dir "test.ml" in
+         DocumentUri.of_path path
+       in
+       let source = "let selected = \"source\"\n" in
+       let* () = Test.open_document ~client ~uri ~source () in
+       let* response =
+         let textDocument = TextDocumentIdentifier.create ~uri in
+         Client.request client (make_request textDocument)
+       in
+       print_formatting_textedits ~source response;
+       Test.exit_client client);
+  [%expect
+    {|
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocp-indent"
+    |}]
+;;
+
+let%expect_test "selects a formatter from workspace configuration" =
+  let outer = Test.temp_dir "ocamllsp-formatter-selection-" in
+  Test.write_file (Filename.concat outer ".ocp-indent") "base=4\n";
+  let dir = Filename.concat outer "workspace" in
+  Unix.mkdir dir 0o700;
+  let bin_dir = Filename.concat dir "bin" in
+  Unix.mkdir bin_dir 0o700;
+  write_formatter bin_dir "ocamlformat";
+  write_formatter bin_dir "ocp-indent";
+  let project name configs =
+    let project = Filename.concat dir name in
+    Unix.mkdir project 0o700;
+    List.iter configs ~f:(fun config ->
+      Test.write_file (Filename.concat project config) "base=4\n");
+    Filename.concat project "test.ml"
+  in
+  let unconfigured = project "unconfigured" [] in
+  let ocp_indent = project "ocp-indent" [ ".ocp-indent" ] in
+  let closer_ocp_indent =
+    let parent = Filename.concat dir "closer-ocp-indent" in
+    Unix.mkdir parent 0o700;
+    Test.write_file (Filename.concat parent ".ocamlformat") "profile=default\n";
+    let child = Filename.concat parent "child" in
+    Unix.mkdir child 0o700;
+    Test.write_file (Filename.concat child ".ocp-indent") "base=4\n";
+    Filename.concat child "test.ml"
+  in
+  let both = project "both" [ ".ocp-indent"; ".ocamlformat" ] in
+  let source = "let selected = \\\"source\\\"\n" in
+  let handler = Client.Handler.make ~on_notification:(fun _ _ -> Fiber.return ()) () in
+  let path = Sys.getenv_opt "PATH" |> Option.value ~default:"" in
+  Test.run_initialized
+    ~handler
+    ~workspaceFolders:(Some [ workspace_folder dir ])
+    ~extra_env:[ "PATH=" ^ bin_dir ^ ":" ^ path ]
+    (fun client ->
+       let format label path =
+         print_endline label;
+         let uri = DocumentUri.of_path path in
+         let* () = Test.open_document ~client ~uri ~source () in
+         let textDocument = TextDocumentIdentifier.create ~uri in
+         let+ response = Client.request client (make_request textDocument) in
+         print_formatting_textedits ~source response
+       in
+       let* () = format "configuration outside workspace:" unconfigured in
+       let* () = format "only .ocp-indent:" ocp_indent in
+       let* () = format "closer .ocp-indent than .ocamlformat:" closer_ocp_indent in
+       print_endline "range with only .ocp-indent:";
+       let uri = DocumentUri.of_path ocp_indent in
+       let textDocument = TextDocumentIdentifier.create ~uri in
+       let* response = Client.request client (make_range_request textDocument) in
+       print_formatting_textedits ~source response;
+       let* () = format "both configurations:" both in
+       let* () = Client.request client Shutdown in
+       Client.notification client Exit);
+  [%expect
+    {|
+    configuration outside workspace:
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocamlformat"
+    only .ocp-indent:
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocp-indent"
+    closer .ocp-indent than .ocamlformat:
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocp-indent"
+    range with only .ocp-indent:
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocp-indent"
+    both configurations:
+    edit: ((0, 0), (1, 0))
+    result:
+    let selected = "ocamlformat"
+    |}]
+;;
+
+let%expect_test "ocp-indent formats documents and ranges" =
+  let dir = Test.temp_dir "ocamllsp-ocp-indent-formatting-" in
+  Test.write_file (Filename.concat dir ".ocp-indent") "base=4\n";
+  let handler = Client.Handler.make ~on_notification:(fun _ _ -> Fiber.return ()) () in
+  Test.run_initialized
+    ~handler
+    ~workspaceFolders:(Some [ workspace_folder dir ])
+    (fun client ->
+       let uri =
+         let path = Filename.concat dir "test.ml" in
+         DocumentUri.of_path path
+       in
+       let source =
+         "let f () =\nprint_endline \"f\"\nlet g () =\nprint_endline \"g\"\n"
+       in
+       let* () = Test.open_document ~client ~uri ~source () in
+       let textDocument = TextDocumentIdentifier.create ~uri in
+       let* response = Client.request client (make_request textDocument) in
+       print_endline "document:";
+       print_formatting_textedits ~source response;
+       let* response =
+         let request =
+           let range =
+             Range.create
+               ~start:(Position.create ~line:1 ~character:0)
+               ~end_:(Position.create ~line:2 ~character:0)
+           in
+           let options = FormattingOptions.create ~tabSize:2 ~insertSpaces:true () in
+           Lsp.Client_request.TextDocumentRangeFormatting
+             (DocumentRangeFormattingParams.create ~textDocument ~range ~options ())
+         in
+         Client.request client request
+       in
+       print_endline "range:";
+       print_formatting_textedits ~source response;
+       Test.exit_client client);
+  [%expect
+    {|
+    document:
+    edit: ((1, 0), (2, 0))
+    edit: ((3, 0), (4, 0))
+    result:
+    let f () =
+        print_endline "f"
+    let g () =
+        print_endline "g"
+    range:
+    edit: ((1, 0), (2, 0))
+    result:
+    let f () =
+        print_endline "f"
+    let g () =
+    print_endline "g"
+    |}]
 ;;
 
 let%expect_test "can format an ocaml impl file" =
@@ -131,15 +352,14 @@ let%expect_test "can format an ocaml impl file" =
   print_formatting source path;
   [%expect
     {|
-    [
-      {
-        "newText": "  | 0, n\n",
-        "range": {
-          "end": { "character": 0, "line": 3 },
-          "start": { "character": 0, "line": 2 }
-        }
-      }
-    ]
+    edit: ((2, 0), (3, 0))
+    result:
+    let rec gcd a b =
+      match (a, b) with
+      | 0, n
+      | n, 0 ->
+        n
+      | _, _ -> gcd a (b mod a)
     |}]
 ;;
 
@@ -172,15 +392,14 @@ end
   print_formatting source path;
   [%expect
     {|
-    [
-      {
-        "newText": "module Test : sig\n",
-        "range": {
-          "end": { "character": 0, "line": 1 },
-          "start": { "character": 0, "line": 0 }
-        }
-      }
-    ]
+    edit: ((0, 0), (1, 0))
+    result:
+    module Test : sig
+      type t =
+        | Foo
+        | Bar
+        | Baz
+    end
     |}]
 ;;
 

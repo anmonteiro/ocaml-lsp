@@ -1,9 +1,9 @@
 open Test.Import
 
-let run_test ~title ~message source =
-  let src, range = Code_actions.parse_selection source in
+let run_test ?source ~title ~message source_text =
+  let src, range = Code_actions.parse_selection source_text in
   Code_actions.apply_code_action
-    ~diagnostics:[ Diagnostic.create ~message:(`String message) ~range () ]
+    ~diagnostics:[ Diagnostic.create ~message:(`String message) ~range ?source () ]
     title
     src
     range
@@ -11,22 +11,32 @@ let run_test ~title ~message source =
 ;;
 
 let mark_test = function
-  | `Value -> run_test ~title:"Mark as unused" ~message:"unused value"
-  | `Open -> run_test ~title:"Replace with open!" ~message:"unused open"
+  | `Value -> run_test ~title:"Mark as unused" ~message:"Warning 26: unused variable x."
+  | `Open ->
+    run_test
+      ~title:"Replace with open!"
+      ~message:"Error (warning 33 [unused-open]): unused open B."
   | `For_loop_index ->
-    run_test ~title:"Mark for-loop index as unused" ~message:"unused for-loop index"
+    run_test
+      ~title:"Mark for-loop index as unused"
+      ~message:"Warning 35: unused for-loop index i."
 ;;
 
 let remove_test = function
-  | `Value -> run_test ~title:"Remove unused" ~message:"unused value"
-  | `Open -> run_test ~title:"Remove unused open" ~message:"unused open"
-  | `Open_bang -> run_test ~title:"Remove unused open!" ~message:"unused open!"
-  | `Type -> run_test ~title:"Remove unused type" ~message:"unused type"
-  | `Module -> run_test ~title:"Remove unused module" ~message:"unused module"
-  | `Case -> run_test ~title:"Remove unused case" ~message:"this match case is unused"
-  | `Rec -> run_test ~title:"Remove unused rec" ~message:"unused rec flag"
+  | `Value -> run_test ~title:"Remove unused" ~message:"Warning 26: unused variable x."
+  | `Open -> run_test ~title:"Remove unused open" ~message:"Warning 33: unused open B."
+  | `Open_bang ->
+    run_test ~title:"Remove unused open!" ~message:"Warning 66: unused open! B."
+  | `Type -> run_test ~title:"Remove unused type" ~message:"Warning 34: unused type t."
+  | `Module ->
+    run_test ~title:"Remove unused module" ~message:"Warning 60: unused module M."
+  | `Case ->
+    run_test ~title:"Remove unused case" ~message:"Warning 11: this match case is unused."
+  | `Rec -> run_test ~title:"Remove unused rec" ~message:"Warning 39: unused rec flag."
   | `Constructor ->
-    run_test ~title:"Remove unused constructor" ~message:"unused constructor"
+    run_test
+      ~title:"Remove unused constructor"
+      ~message:"Warning 37: unused constructor A."
 ;;
 
 let%expect_test "mark value in let" =
@@ -41,7 +51,8 @@ let f =
     {|
     let f =
       let _x = 1 in
-      0 |}]
+      0
+    |}]
 ;;
 
 (* todo *)
@@ -57,7 +68,8 @@ let $f$ =
     {|
     let _f =
       let x = 1 in
-      0 |}]
+      0
+    |}]
 ;;
 
 let%expect_test "mark value in match" =
@@ -70,7 +82,8 @@ let f = function
   [%expect
     {|
     let f = function
-      | _x -> 0 |}]
+      | _x -> 0
+    |}]
 ;;
 
 let%expect_test "remove value in let" =
@@ -84,7 +97,8 @@ let f =
   [%expect
     {|
     let f =
-      0 |}]
+      0
+    |}]
 ;;
 
 (* todo *)
@@ -107,6 +121,17 @@ $open M$
   [%expect {| open! M |}]
 ;;
 
+let%expect_test "mark open reported by Dune" =
+  run_test
+    ~source:"dune (pid=123)"
+    ~title:"Replace with open!"
+    ~message:"unused open"
+    {|
+$open M$
+|};
+  [%expect {| open! M |}]
+;;
+
 let%expect_test "mark for loop index" =
   mark_test
     `For_loop_index
@@ -121,7 +146,8 @@ let () =
     let () =
       for _i = 0 to 10 do
         ()
-      done |}]
+      done
+    |}]
 ;;
 
 let%expect_test "remove open" =
@@ -140,7 +166,8 @@ let%expect_test "remove open!" =
     {|
 open A
 $open! B$
-|}
+|};
+  [%expect {| open A |}]
 ;;
 
 let%expect_test "remove type" =
@@ -174,7 +201,8 @@ let f = function
   [%expect
     {|
     let f = function
-     | 0 -> 0 |}]
+     | 0 -> 0
+    |}]
 ;;
 
 let%expect_test "remove case after Unicode" =
@@ -187,7 +215,11 @@ let f = function
 |}
   in
   let diagnostics =
-    [ Diagnostic.create ~message:(`String "this match case is unused") ~range () ]
+    [ Diagnostic.create
+        ~message:(`String "Warning 11: this match case is unused.")
+        ~range
+        ()
+    ]
   in
   Code_actions.print_code_actions
     ~diagnostics
@@ -202,7 +234,7 @@ let f = function
     {
       "diagnostics": [
         {
-          "message": "this match case is unused",
+          "message": "Warning 11: this match case is unused.",
           "range": {
             "end": { "character": 12, "line": 3 },
             "start": { "character": 3, "line": 3 }
@@ -240,7 +272,7 @@ let café = let rec $f$ = 0 in f
 |}
   in
   let diagnostics =
-    [ Diagnostic.create ~message:(`String "unused rec flag") ~range () ]
+    [ Diagnostic.create ~message:(`String "Warning 39: unused rec flag.") ~range () ]
   in
   Code_actions.print_code_actions
     ~diagnostics
@@ -255,7 +287,7 @@ let café = let rec $f$ = 0 in f
     {
       "diagnostics": [
         {
-          "message": "unused rec flag",
+          "message": "Warning 39: unused rec flag.",
           "range": {
             "end": { "character": 20, "line": 1 },
             "start": { "character": 19, "line": 1 }
@@ -305,7 +337,8 @@ type t =
   [%expect
     {|
     type t =
-      | A |}]
+      | A
+    |}]
 ;;
 
 let%expect_test "remove constructor" =
@@ -320,7 +353,8 @@ type t =
     {|
     type t =
 
-     | B |}]
+     | B
+    |}]
 ;;
 
 let%expect_test "remove constructor" =
@@ -335,5 +369,59 @@ type t =
     {|
     type t =
 
-     | B |}]
+     | B
+    |}]
+;;
+
+let%expect_test "deprecated alert text is not an unused diagnostic" =
+  let source =
+    {ocaml|module M = struct let x = 1 end [@@deprecated "do not use: unused open"]
+open M
+let y = x
+|ocaml}
+  in
+  let published_diagnostics = Fiber.Ivar.create () in
+  let handler =
+    Client.Handler.make
+      ~on_notification:(fun _ -> function
+         | PublishDiagnostics diagnostics ->
+           let* filled = Fiber.Ivar.peek published_diagnostics in
+           (match filled with
+            | Some _ -> Fiber.return ()
+            | None -> Fiber.Ivar.fill published_diagnostics diagnostics)
+         | _ -> Fiber.return ())
+      ()
+  in
+  Test.run_initialized ~handler (fun client ->
+    let* () = Test.open_document ~client ~uri:Helpers.uri ~source () in
+    let* { PublishDiagnosticsParams.diagnostics; _ } =
+      Fiber.Ivar.read published_diagnostics
+    in
+    let diagnostic =
+      List.find_exn diagnostics ~f:(fun (diagnostic : Diagnostic.t) ->
+        let message =
+          match diagnostic.message with
+          | `String message -> message
+          | `MarkupContent { value; _ } -> value
+        in
+        String.is_prefix message ~prefix:"Alert deprecated")
+    in
+    let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+    let context =
+      CodeActionContext.create
+        ~diagnostics:[ diagnostic ]
+        ~only:[ CodeActionKind.QuickFix ]
+        ()
+    in
+    let params =
+      CodeActionParams.create ~textDocument ~range:diagnostic.range ~context ()
+    in
+    let* response = Client.request client (CodeAction params) in
+    Code_actions.print_code_action_result
+      ~filter:(function
+        | `CodeAction { title; _ } -> String.equal title "Remove unused open"
+        | `Command _ -> false)
+      response;
+    Test.shutdown_client client);
+  [%expect {| No code actions |}]
 ;;

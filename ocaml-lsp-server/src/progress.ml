@@ -15,10 +15,9 @@ type t =
   | Enabled of enabled
 
 let create (client_capabilities : ClientCapabilities.t) ~report_progress ~create_task =
-  match client_capabilities.window with
-  | Some { workDoneProgress = Some true; _ } ->
-    Enabled { token = None; build_counter = 0; create_task; report_progress }
-  | _ -> Disabled
+  if Capabilities.work_done_progress client_capabilities
+  then Enabled { token = None; build_counter = 0; create_task; report_progress }
+  else Disabled
 ;;
 
 let end_build (t : enabled) ~message =
@@ -59,7 +58,7 @@ let start_build (t : enabled) =
 let build_progress t (progress : Drpc.Progress.t) =
   Fiber.of_thunk (fun () ->
     match t with
-    | Disabled -> invalid_arg "progress reporting is not supported"
+    | Disabled -> Fiber.return ()
     | Enabled ({ token; report_progress; _ } as t) ->
       (match progress with
        | Success -> end_build t ~message:"Build finished"

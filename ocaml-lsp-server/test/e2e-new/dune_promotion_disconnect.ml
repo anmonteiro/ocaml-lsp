@@ -12,12 +12,13 @@ let%expect_test "promotion registrations when Dune disconnects" =
          Test.write_file project.gate "";
          let* initial = Events.wait_for_diagnostics events.dune ~f:has_dune_diagnostic in
          let* registration = Mailbox.wait events.registrations in
+         let promotion_cleanup = Mailbox.wait events.unregistrations in
          stop_dune project;
          let* cleared =
            Events.wait_for_diagnostics events.dune ~f:(fun params ->
              for_uri initial.uri params && no_dune_diagnostic params)
          in
-         let* () = Lev_fiber.Timer.sleepf 0.02 in
+         let* unregistration = promotion_cleanup in
          print_payload
            project
            "initial textDocument/publishDiagnostics:"
@@ -34,7 +35,21 @@ let%expect_test "promotion registrations when Dune disconnects" =
            project
            "client/unregisterCapability after Dune disconnects:"
            UnregistrationParams.yojson_of_t
-           (Mailbox.take_pending events.unregistrations);
+           (unregistration :: Mailbox.take_pending events.unregistrations);
+         restart_dune project;
+         let* () = Signal.wait (Events.dune_ready events.dune) in
+         let* reconnected =
+           Events.wait_for_diagnostics events.dune ~f:has_dune_diagnostic
+         in
+         let* reregistration = Mailbox.wait events.registrations in
+         print_payload
+           project
+           "textDocument/publishDiagnostics after Dune reconnects:"
+           (PublishDiagnosticsParams.yojson_of_t reconnected);
+         print_payload
+           project
+           "client/registerCapability after Dune reconnects:"
+           (RegistrationParams.yojson_of_t reregistration);
          Fiber.return ()));
   [%expect
     {|
@@ -61,9 +76,7 @@ let%expect_test "promotion registrations when Dune disconnects" =
           "method": "textDocument/codeAction",
           "registerOptions": {
             "codeActionKinds": [ "quickfix" ],
-            "documentSelector": [
-              { "language": null, "scheme": null, "pattern": "<document-path>" }
-            ]
+            "documentSelector": [ { "pattern": "<document-path>" } ]
           }
         }
       ]
@@ -71,6 +84,43 @@ let%expect_test "promotion registrations when Dune disconnects" =
     textDocument/publishDiagnostics after Dune disconnects:
     { "diagnostics": [], "uri": "<document-uri>" }
     client/unregisterCapability after Dune disconnects:
-    []
+    [
+      {
+        "unregisterations": [
+          {
+            "id": "ocamllsp-promote/<document-uri>",
+            "method": "textDocument/codeAction"
+          }
+        ]
+      }
+    ]
+    textDocument/publishDiagnostics after Dune reconnects:
+    {
+      "diagnostics": [
+        {
+          "message": "--- expected.ml\n+++ actual.ml\n@@ -1 +1 @@\n-let answer = 0\n+let answer = 42\n\\ No newline at end of file",
+          "range": {
+            "end": { "character": 0, "line": 0 },
+            "start": { "character": 0, "line": 0 }
+          },
+          "severity": 1,
+          "source": "dune"
+        }
+      ],
+      "uri": "<document-uri>"
+    }
+    client/registerCapability after Dune reconnects:
+    {
+      "registrations": [
+        {
+          "id": "ocamllsp-promote/<document-uri>",
+          "method": "textDocument/codeAction",
+          "registerOptions": {
+            "codeActionKinds": [ "quickfix" ],
+            "documentSelector": [ { "pattern": "<document-path>" } ]
+          }
+        }
+      ]
+    }
     |}]
 ;;

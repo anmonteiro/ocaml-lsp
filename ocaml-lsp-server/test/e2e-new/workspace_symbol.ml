@@ -78,6 +78,56 @@ let%expect_test "reports deprecated workspace symbols" =
     |}]
 ;;
 
+let%expect_test "uses deprecated workspace symbol tags when supported" =
+  let workspace_a, _workspace_b = setup_workspaces () in
+  Test.write_file
+    (Filename.concat workspace_a.path "lib/LibTypes.mli")
+    (a_lib_types_mli ^ "\nval deprecated_value : int [@@deprecated]\n");
+  build_project workspace_a;
+  let capabilities =
+    let tagSupport = ClientSymbolTagOptions.create ~valueSet:[ SymbolTag.Deprecated ] in
+    let symbol = WorkspaceSymbolClientCapabilities.create ~tagSupport () in
+    let workspace = WorkspaceClientCapabilities.create ~symbol () in
+    ClientCapabilities.create ~workspace ()
+  in
+  run ~capabilities [ workspace_a ] (fun client ->
+    let* symbols = workspace_symbol client "deprecated_value" in
+    (match symbols with
+     | Some [ symbol ] ->
+       let deprecated =
+         Option.value_map symbol.deprecated ~default:"missing" ~f:Bool.to_string
+       in
+       let tags =
+         Option.value_map symbol.tags ~default:"missing" ~f:(fun _ -> "present")
+       in
+       Printf.printf "name: %s\ndeprecated: %s\ntags: %s\n" symbol.name deprecated tags
+     | _ -> print_endline "expected exactly one symbol");
+    Fiber.return ());
+  [%expect
+    {|
+    name: deprecated_value
+    deprecated: missing
+    tags: present
+    |}]
+;;
+
+let%expect_test "deduplicates symbols from duplicate build artifacts" =
+  let workspace_a, _workspace_b = setup_workspaces () in
+  build_project workspace_a;
+  let build_dir = Filename.concat workspace_a.path "_build/default" in
+  let original = Filename.concat build_dir "bin/.main.eobjs/byte/dune__exe__A.cmt" in
+  let duplicate_dir = Filename.concat build_dir "duplicate" in
+  Unix.mkdir duplicate_dir 0o700;
+  let contents = In_channel.with_open_bin original In_channel.input_all in
+  Test.write_file (Filename.concat duplicate_dir "a.cmt") contents;
+  run [ workspace_a ] (fun client ->
+    let* symbols = workspace_symbol client "a_x" in
+    let count = Option.value symbols ~default:[] |> List.length in
+    Printf.printf "a_x symbols: %d\n" count;
+    Fiber.return ());
+  [%expect {| a_x symbols: 1 |}]
+;;
+
 let%expect_test "returns filtered symbols from workspace" =
   let workspace_a, _workspace_b = setup_workspaces () in
   build_project workspace_a;

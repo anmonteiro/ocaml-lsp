@@ -3,7 +3,13 @@ open Fiber.O
 
 let position_of_offset source offset =
   let (`Logical (line, character)) = Msource.get_logical source (`Offset offset) in
-  Position.create ~line:(line - 1) ~character
+  Position.of_logical ~line ~character
+;;
+
+let compare_text_edit (a : TextEdit.t) (b : TextEdit.t) =
+  match Range.compare a.range b.range with
+  | 0 -> String.compare a.newText b.newText
+  | ordering -> ordering
 ;;
 
 let is_parenthesized source ~start_offset ~end_offset =
@@ -15,8 +21,7 @@ let is_parenthesized source ~start_offset ~end_offset =
 (* Merlin includes the syntactically required parentheses in symbolic operator
    locations. Rename only the operator so that clients do not use the
    parentheses as part of its name. *)
-let identifier_range source loc =
-  let range = Range.of_loc loc in
+let identifier_range source (range : Range.t) =
   let (`Offset start_offset) = Msource.get_offset source (Position.logical range.start) in
   let (`Offset end_offset) = Msource.get_offset source (Position.logical range.end_) in
   let source_text = Msource.text source in
@@ -48,6 +53,38 @@ let identifier_range source loc =
     else range
 ;;
 
+let request_failed message =
+  Jsonrpc.Response.Error.raise
+    (Jsonrpc.Response.Error.make ~code:RequestFailed ~message ())
+;;
+
+let configured_values ~operation results =
+  let values, errors =
+    Merlin_dot_protocol.Nonempty_list.to_list results
+    |> List.fold_left ~init:([], []) ~f:(fun (values, errors) result ->
+      let { Document.Merlin.configuration; result } = result in
+      match result with
+      | Ok value -> (configuration, value) :: values, errors
+      | Error error -> values, (configuration, error) :: errors)
+  in
+  match errors with
+  | [] -> List.rev values
+  | errors ->
+    List.iter errors ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          ("Merlin configuration failed while computing " ^ operation)
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    let modes =
+      List.rev_map errors ~f:(fun (configuration, _) ->
+        Merlin_config.configuration_label configuration)
+      |> String.concat ~sep:", "
+    in
+    request_failed (sprintf "%s failed for modes: %s" operation modes)
+;;
+
 let prepare
       (state : State.t)
       { PrepareRenameParams.textDocument = { uri }; position; workDoneToken = _ }
@@ -56,21 +93,102 @@ let prepare
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin merlin ->
-    let+ occurrences, (_ : Query_protocol.occurrences_status) =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
+    let+ results =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         merlin
+        ~configurations
         (Query_protocol.Occurrences (`Ident_at (Position.logical position), `Buffer))
     in
     let source = Document.source doc in
-    List.find_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-      if occurrence.is_stale
-      then None
-      else (
-        let range = identifier_range source occurrence.loc in
-        if Lsp.Range.contains_position range position ~inclusive_end:true
-        then Some range
-        else None))
+    let ranges =
+      configured_values ~operation:"prepare rename" results
+      |> List.map ~f:(fun (configuration, (occurrences, _)) ->
+        let range =
+          List.find_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
+            if occurrence.is_stale
+            then None
+            else (
+              let range = Range.of_loc occurrence.loc |> identifier_range source in
+              if Lsp.Range.contains_position range position ~inclusive_end:true
+              then Some range
+              else None))
+        in
+        configuration, range)
+    in
+    (match ranges with
+     | [] -> None
+     | (_, None) :: _ -> None
+     | (_, Some first) :: rest ->
+       if
+         List.for_all rest ~f:(function
+           | _, Some range -> Poly.equal range first
+           | _, None -> false)
+       then Some first
+       else request_failed "The applicable modes produced different rename ranges")
+;;
+
+let workspace_edit_of_locations ~document_changes ~documents ~new_name locations =
+  let edits =
+    List.fold_left
+      locations
+      ~init:(Map.empty (module Uri))
+      ~f:(fun acc (uri, range) -> Map.add_multi acc ~key:uri ~data:range)
+    |> Map.mapi ~f:(fun ~key:doc_uri ~data:ranges ->
+      let source =
+        match Map.find documents doc_uri with
+        | Some document -> Document.source document
+        | None ->
+          let source_path = Uri.to_path doc_uri in
+          In_channel.with_open_text source_path In_channel.input_all |> Msource.make
+      in
+      List.map ranges ~f:(fun range ->
+        let edit =
+          let range = identifier_range source range in
+          TextEdit.create ~range ~newText:new_name
+        in
+        match edit.range.start with
+        | { character = 0; _ } -> edit
+        | pos ->
+          let (`Offset index) =
+            let mpos = Position.logical pos in
+            Msource.get_offset source mpos
+          in
+          assert (index > 0)
+          (* [index = 0] if we pass [`Logical (1, 0)], but we handle the case
+              when [character = 0] in a separate matching branch *);
+          let source_txt = Msource.text source in
+          (* TODO: handle record field puning *)
+          (match source_txt.[index - 1] with
+           | '~' (* the occurrence is a named argument *)
+           | '?' (* is an optional argument *) ->
+             let empty_range_at_occur_end =
+               let occur_end_pos = edit.range.end_ in
+               { edit.range with start = occur_end_pos }
+             in
+             TextEdit.create ~range:empty_range_at_occur_end ~newText:(":" ^ new_name)
+           | _ -> edit))
+      |> List.stable_dedup ~compare:compare_text_edit)
+  in
+  if document_changes
+  then (
+    let documentChanges =
+      Map.to_alist edits
+      |> List.map ~f:(fun (uri, edits) ->
+        let textDocument =
+          let version = Map.find documents uri |> Option.map ~f:Document.version in
+          OptionalVersionedTextDocumentIdentifier.create ~uri ?version ()
+        in
+        let edits = List.map edits ~f:(fun e -> `TextEdit e) in
+        `TextDocumentEdit (TextDocumentEdit.create ~textDocument ~edits))
+    in
+    WorkspaceEdit.create ~documentChanges ())
+  else (
+    let changes = Map.to_alist edits in
+    WorkspaceEdit.create ~changes ())
 ;;
 
 let rename (state : State.t) { RenameParams.textDocument = { uri }; position; newName; _ }
@@ -79,92 +197,56 @@ let rename (state : State.t) { RenameParams.textDocument = { uri }; position; ne
   match Document.kind doc with
   | `Other -> Fiber.return (WorkspaceEdit.create ())
   | `Merlin merlin ->
+    let documents =
+      Document_store.fold
+        state.store
+        ~init:(Map.empty (module Uri))
+        ~f:(fun document documents ->
+          let uri = Document.uri document |> Source_path.uri in
+          Map.set documents ~key:uri ~data:document)
+    in
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
     let command =
       Query_protocol.Occurrences (`Ident_at (Position.logical position), `Renaming)
     in
-    let+ occurrences, _desync =
-      Document.Merlin.dispatch_exn ~name:"rename" merlin command
+    let+ results =
+      Document.Merlin.dispatch_all ~name:"rename" merlin ~configurations command
     in
-    let locs =
-      List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-        match occurrence.is_stale with
-        | true -> None
-        | false -> Some occurrence.loc)
-    in
-    let locs =
-      List.fold_left
-        locs
-        ~init:(Map.empty (module Uri))
-        ~f:(fun acc (loc : Warnings.loc) ->
-          let uri =
-            match loc.loc_start.pos_fname with
-            | "" -> uri
-            | path -> Uri.of_path path
-          in
-          Map.add_multi acc ~key:uri ~data:loc)
+    let canonical_uri = Source_path.uri uri in
+    let document_changes =
+      Capabilities.workspace_edit_document_changes (State.client_capabilities state)
     in
     let edits =
-      Map.mapi locs ~f:(fun ~key:doc_uri ~data:locs ->
-        let source =
-          match Document_store.get_opt state.store doc_uri with
-          | Some doc when DocumentUri.equal doc_uri (Document.uri doc) ->
-            Document.source doc
-          | Some _ | None ->
-            let source_path = Uri.to_path doc_uri in
-            In_channel.with_open_text source_path In_channel.input_all |> Msource.make
+      configured_values ~operation:"rename" results
+      |> List.map ~f:(fun (configuration, (occurrences, _)) ->
+        let locations =
+          List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
+            if occurrence.is_stale
+            then None
+            else (
+              let loc = occurrence.loc in
+              let uri =
+                match loc.loc_start.pos_fname with
+                | "" -> canonical_uri
+                | path -> Source_path.of_path path
+              in
+              Some (uri, Range.of_loc loc)))
         in
-        List.map locs ~f:(fun loc ->
-          let range = identifier_range source loc in
-          let edit = TextEdit.create ~range ~newText:newName in
-          let start_position = edit.range.start in
-          match start_position with
-          | { character = 0; _ } -> edit
-          | pos ->
-            let mpos = Position.logical pos in
-            let (`Offset index) = Msource.get_offset source mpos in
-            assert (index > 0)
-            (* [index = 0] if we pass [`Logical (1, 0)], but we handle the case
-                 when [character = 0] in a separate matching branch *);
-            let source_txt = Msource.text source in
-            (* TODO: handle record field puning *)
-            (match source_txt.[index - 1] with
-             | '~' (* the occurrence is a named argument *)
-             | '?' (* is an optional argument *) ->
-               let empty_range_at_occur_end =
-                 let occur_end_pos = edit.range.end_ in
-                 { edit.range with start = occur_end_pos }
-               in
-               TextEdit.create ~range:empty_range_at_occur_end ~newText:(":" ^ newName)
-             | _ -> edit)))
-    in
-    let workspace_edits =
-      let documentChanges =
-        let open Option.O in
-        Option.value
-          ~default:false
-          (let client_capabilities = State.client_capabilities state in
-           let* workspace = client_capabilities.workspace in
-           let* edit = workspace.workspaceEdit in
-           edit.documentChanges)
-      in
-      if documentChanges
-      then (
-        let documentChanges =
-          Map.to_alist edits
-          |> List.map ~f:(fun (uri, edits) ->
-            let version =
-              Document_store.get_opt state.store uri |> Option.map ~f:Document.version
-            in
-            let textDocument =
-              OptionalVersionedTextDocumentIdentifier.create ~uri ?version ()
-            in
-            let edits = List.map edits ~f:(fun e -> `TextEdit e) in
-            `TextDocumentEdit (TextDocumentEdit.create ~textDocument ~edits))
+        let edit =
+          workspace_edit_of_locations
+            ~document_changes
+            ~documents
+            ~new_name:newName
+            locations
         in
-        WorkspaceEdit.create ~documentChanges ())
-      else (
-        let changes = Map.to_alist edits in
-        WorkspaceEdit.create ~changes ())
+        configuration, edit)
     in
-    workspace_edits
+    (match edits with
+     | [] -> WorkspaceEdit.create ()
+     | (_, first) :: rest ->
+       if List.for_all rest ~f:(fun (_, edit) -> Poly.equal edit first)
+       then first
+       else request_failed "The applicable modes produced different rename targets")
 ;;

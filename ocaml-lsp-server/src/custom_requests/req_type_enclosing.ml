@@ -79,7 +79,7 @@ let config_with_given_verbosity config verbosity =
 ;;
 
 let with_pipeline state uri verbosity with_pipeline =
-  Util.with_merlin state uri ~default:`Null (fun merlin ->
+  Util.with_primary_merlin state uri ~default:`Null (fun merlin ->
     let open Fiber.O in
     let* config = Document.Merlin.mconfig merlin in
     Document.Merlin.with_configurable_pipeline_exn

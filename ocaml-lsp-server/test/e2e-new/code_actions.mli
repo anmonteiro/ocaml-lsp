@@ -10,6 +10,7 @@ val range
 val iter_code_actions
   :  ?prep:(unit Test.Import.Client.t -> unit Fiber.t)
   -> ?path:string
+  -> ?capabilities:ClientCapabilities.t
   -> ?diagnostics:Diagnostic.t list
   -> ?only:CodeActionKind.t list
   -> source:string
@@ -28,6 +29,7 @@ val print_code_actions
   -> ?diagnostics:Diagnostic.t list
   -> ?only:CodeActionKind.t list
   -> ?filter:([ `Command of Command.t | `CodeAction of CodeAction.t ] -> bool)
+  -> ?capabilities:ClientCapabilities.t
   -> string
   -> Range.t
   -> unit
@@ -46,13 +48,24 @@ val find_remove_annotation_action
 val parse_selection : string -> string * Range.t
 
 val apply_code_action
-  :  ?diagnostics:Diagnostic.t list
+  :  ?prep:(unit Test.Import.Client.t -> unit Fiber.t)
+  -> ?path:string
+  -> ?diagnostics:Diagnostic.t list
+  -> ?filter:([ `Command of Command.t | `CodeAction of CodeAction.t ] -> bool)
   -> string
   -> string
   -> Range.t
   -> string option
 
 (** [code_action_test title source] runs the code action with title [title] and
-    prints the resulting source. When [print_none] is set, it explicitly prints
-    when the action is unavailable. *)
-val code_action_test : ?print_none:bool -> title:string -> string -> unit
+    prints the resulting source. [filter] can further identify the intended
+    action, and [print_none] explicitly prints when it is unavailable. *)
+val code_action_test
+  :  ?prep:(unit Test.Import.Client.t -> unit Fiber.t)
+  -> ?path:string
+  -> ?diagnostics:Diagnostic.t list
+  -> ?filter:([ `Command of Command.t | `CodeAction of CodeAction.t ] -> bool)
+  -> ?print_none:bool
+  -> title:string
+  -> string
+  -> unit

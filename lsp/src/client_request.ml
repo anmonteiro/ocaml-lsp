@@ -2,6 +2,11 @@ open! Import
 open Types
 open Extension
 
+type workspace_symbol_result =
+  [ `SymbolInformation of SymbolInformation.t list
+  | `WorkspaceSymbol of WorkspaceSymbol.t list
+  ]
+
 type _ t =
   | Shutdown : unit t
   | Initialize : InitializeParams.t -> InitializeResult.t t
@@ -13,7 +18,7 @@ type _ t =
   | TextDocumentCompletion :
       CompletionParams.t
       -> [ `CompletionList of CompletionList.t | `List of CompletionItem.t list ] option t
-  | TextDocumentCodeLens : CodeLensParams.t -> CodeLens.t list t
+  | TextDocumentCodeLens : CodeLensParams.t -> CodeLens.t list option t
   | InlayHint : InlayHintParams.t -> InlayHint.t list option t
   | InlayHintResolve : InlayHint.t -> InlayHint.t t
   | TextDocumentDiagnostic : DocumentDiagnosticParams.t -> DocumentDiagnosticReport.t t
@@ -39,7 +44,7 @@ type _ t =
   | TextDocumentRangesFormatting :
       DocumentRangesFormattingParams.t
       -> TextEdit.t list option t
-  | TextDocumentRename : RenameParams.t -> WorkspaceEdit.t t
+  | TextDocumentRename : RenameParams.t -> WorkspaceEdit.t option t
   | TextDocumentLink : DocumentLinkParams.t -> DocumentLink.t list option t
   | TextDocumentLinkResolve : DocumentLink.t -> DocumentLink.t t
   | TextDocumentMoniker : MonikerParams.t -> Moniker.t list option t
@@ -50,7 +55,7 @@ type _ t =
          ]
            option
            t
-  | WorkspaceSymbol : WorkspaceSymbolParams.t -> SymbolInformation.t list option t
+  | WorkspaceSymbol : WorkspaceSymbolParams.t -> workspace_symbol_result option t
   | WorkspaceSymbolResolve : WorkspaceSymbol.t -> WorkspaceSymbol.t t
   | DebugEcho : DebugEcho.Params.t -> DebugEcho.Result.t t
   | DebugTextDocumentGet :
@@ -59,7 +64,7 @@ type _ t =
   | TextDocumentReferences : ReferenceParams.t -> Location.t list option t
   | TextDocumentHighlight : DocumentHighlightParams.t -> DocumentHighlight.t list option t
   | TextDocumentFoldingRange : FoldingRangeParams.t -> FoldingRange.t list option t
-  | SignatureHelp : SignatureHelpParams.t -> SignatureHelp.t t
+  | SignatureHelp : SignatureHelpParams.t -> SignatureHelp.t option t
   | CodeAction : CodeActionParams.t -> CodeActionResult.t t
   | CodeActionResolve : CodeAction.t -> CodeAction.t t
   | CompletionItemResolve : CompletionItem.t -> CompletionItem.t t
@@ -74,7 +79,7 @@ type _ t =
       ColorPresentationParams.t
       -> ColorPresentation.t list t
   | TextDocumentColor : DocumentColorParams.t -> ColorInformation.t list t
-  | SelectionRange : SelectionRangeParams.t -> SelectionRange.t list t
+  | SelectionRange : SelectionRangeParams.t -> SelectionRange.t list option t
   | ExecuteCommand : ExecuteCommandParams.t -> Json.t t
   | SemanticTokensFull : SemanticTokensParams.t -> SemanticTokens.t option t
   | SemanticTokensDelta :
@@ -110,6 +115,28 @@ type _ t =
       ; params : Jsonrpc.Structured.t option
       }
       -> Json.t t
+
+let yojson_of_workspace_symbol_result (result : workspace_symbol_result) : Json.t =
+  match result with
+  | `SymbolInformation symbols -> Json.To.list SymbolInformation.yojson_of_t symbols
+  | `WorkspaceSymbol symbols -> Json.To.list WorkspaceSymbol.yojson_of_t symbols
+;;
+
+let workspace_symbol_result_of_yojson json : workspace_symbol_result =
+  let is_workspace_symbol = function
+    | `Assoc fields ->
+      Option.is_some (List.assoc_opt "data" fields)
+      ||
+        (match List.assoc_opt "location" fields with
+        | Some (`Assoc location) -> Option.is_none (List.assoc_opt "range" location)
+        | _ -> false)
+    | _ -> false
+  in
+  match json with
+  | `List symbols when List.exists symbols ~f:is_workspace_symbol ->
+    `WorkspaceSymbol (Json.Of.list WorkspaceSymbol.t_of_yojson json)
+  | _ -> `SymbolInformation (Json.Of.list SymbolInformation.t_of_yojson json)
+;;
 
 let yojson_of_DocumentSymbol ds : Json.t =
   Json.Option.yojson_of_t
@@ -157,7 +184,8 @@ let yojson_of_result (type a) (req : a t) (result : a) =
   | TextDocumentImplementation _, result ->
     Json.Option.yojson_of_t Locations.yojson_of_t result
   | TextDocumentCompletion _, result -> yojson_of_Completion result
-  | TextDocumentCodeLens _, result -> Json.To.list CodeLens.yojson_of_t result
+  | TextDocumentCodeLens _, result ->
+    Json.Option.yojson_of_t (Json.To.list CodeLens.yojson_of_t) result
   | TextDocumentCodeLensResolve _, result -> CodeLens.yojson_of_t result
   | TextDocumentPrepareCallHierarchy _, result ->
     Json.Option.yojson_of_t (Json.To.list CallHierarchyItem.yojson_of_t) result
@@ -169,7 +197,8 @@ let yojson_of_result (type a) (req : a t) (result : a) =
     Json.Option.yojson_of_t (Json.To.list TextEdit.yojson_of_t) result
   | TextDocumentRangesFormatting _, result ->
     Json.Option.yojson_of_t (Json.To.list TextEdit.yojson_of_t) result
-  | TextDocumentRename _, result -> WorkspaceEdit.yojson_of_t result
+  | TextDocumentRename _, result ->
+    Json.Option.yojson_of_t WorkspaceEdit.yojson_of_t result
   | DocumentSymbol _, result -> yojson_of_DocumentSymbol result
   | DebugEcho _, result -> DebugEcho.Result.yojson_of_t result
   | DebugTextDocumentGet _, result -> DebugTextDocumentGet.Result.yojson_of_t result
@@ -181,7 +210,7 @@ let yojson_of_result (type a) (req : a t) (result : a) =
     Json.Option.yojson_of_t (Json.To.list FoldingRange.yojson_of_t) result
   | TextDocumentMoniker _, result ->
     Json.Option.yojson_of_t (Json.To.list Moniker.yojson_of_t) result
-  | SignatureHelp _, result -> SignatureHelp.yojson_of_t result
+  | SignatureHelp _, result -> Json.Option.yojson_of_t SignatureHelp.yojson_of_t result
   | CodeAction _, result -> CodeActionResult.yojson_of_t result
   | CodeActionResolve _, result -> CodeAction.yojson_of_t result
   | CompletionItemResolve _, result -> CompletionItem.yojson_of_t result
@@ -195,11 +224,12 @@ let yojson_of_result (type a) (req : a t) (result : a) =
     Json.Option.yojson_of_t (Json.To.list DocumentLink.yojson_of_t) result
   | TextDocumentLinkResolve _, result -> DocumentLink.yojson_of_t result
   | WorkspaceSymbol _, result ->
-    Json.Option.yojson_of_t (Json.To.list SymbolInformation.yojson_of_t) result
+    Json.Option.yojson_of_t yojson_of_workspace_symbol_result result
   | TextDocumentColorPresentation _, result ->
     Json.To.list ColorPresentation.yojson_of_t result
   | TextDocumentColor _, result -> Json.To.list ColorInformation.yojson_of_t result
-  | SelectionRange _, result -> Json.yojson_of_list SelectionRange.yojson_of_t result
+  | SelectionRange _, result ->
+    Json.Option.yojson_of_t (Json.To.list SelectionRange.yojson_of_t) result
   | SemanticTokensFull _, result ->
     Json.Option.yojson_of_t SemanticTokens.yojson_of_t result
   | SemanticTokensDelta _, result -> yojson_of_SemanticTokensDelta result
@@ -568,7 +598,7 @@ let response_of_json (type a) (t : a t) (json : Json.t) : a =
          ; (fun json -> `List (list_of_yojson CompletionItem.t_of_yojson json))
          ])
       json
-  | TextDocumentCodeLens _ -> list_of_yojson CodeLens.t_of_yojson json
+  | TextDocumentCodeLens _ -> option_of_yojson (list_of_yojson CodeLens.t_of_yojson) json
   | TextDocumentCodeLensResolve _ -> CodeLens.t_of_yojson json
   | TextDocumentPrepareCallHierarchy _ ->
     option_of_yojson (list_of_yojson CallHierarchyItem.t_of_yojson) json
@@ -577,7 +607,7 @@ let response_of_json (type a) (t : a t) (json : Json.t) : a =
     option_of_yojson (list_of_yojson TextEdit.t_of_yojson) json
   | TextDocumentRangesFormatting _ ->
     option_of_yojson (list_of_yojson TextEdit.t_of_yojson) json
-  | TextDocumentRename _ -> WorkspaceEdit.t_of_yojson json
+  | TextDocumentRename _ -> option_of_yojson WorkspaceEdit.t_of_yojson json
   | TextDocumentLink _ -> option_of_yojson (list_of_yojson DocumentLink.t_of_yojson) json
   | TextDocumentLinkResolve _ -> DocumentLink.t_of_yojson json
   | TextDocumentMoniker _ -> option_of_yojson (list_of_yojson Moniker.t_of_yojson) json
@@ -590,8 +620,7 @@ let response_of_json (type a) (t : a t) (json : Json.t) : a =
              `SymbolInformation (list_of_yojson SymbolInformation.t_of_yojson json))
          ])
       json
-  | WorkspaceSymbol _ ->
-    option_of_yojson (list_of_yojson SymbolInformation.t_of_yojson) json
+  | WorkspaceSymbol _ -> option_of_yojson workspace_symbol_result_of_yojson json
   | DebugEcho _ -> DebugEcho.Result.t_of_yojson json
   | DebugTextDocumentGet _ -> DebugTextDocumentGet.Result.t_of_yojson json
   | TextDocumentReferences _ ->
@@ -600,7 +629,7 @@ let response_of_json (type a) (t : a t) (json : Json.t) : a =
     option_of_yojson (list_of_yojson DocumentHighlight.t_of_yojson) json
   | TextDocumentFoldingRange _ ->
     option_of_yojson (list_of_yojson FoldingRange.t_of_yojson) json
-  | SignatureHelp _ -> SignatureHelp.t_of_yojson json
+  | SignatureHelp _ -> option_of_yojson SignatureHelp.t_of_yojson json
   | CodeAction _ -> CodeActionResult.t_of_yojson json
   | CodeActionResolve _ -> CodeAction.t_of_yojson json
   | CompletionItemResolve _ -> CompletionItem.t_of_yojson json
@@ -612,7 +641,7 @@ let response_of_json (type a) (t : a t) (json : Json.t) : a =
     option_of_yojson (list_of_yojson TextEdit.t_of_yojson) json
   | TextDocumentColorPresentation _ -> list_of_yojson ColorPresentation.t_of_yojson json
   | TextDocumentColor _ -> list_of_yojson ColorInformation.t_of_yojson json
-  | SelectionRange _ -> list_of_yojson SelectionRange.t_of_yojson json
+  | SelectionRange _ -> option_of_yojson (list_of_yojson SelectionRange.t_of_yojson) json
   | ExecuteCommand _ -> json
   | SemanticTokensFull _ -> option_of_yojson SemanticTokens.t_of_yojson json
   | SemanticTokensDelta _ ->

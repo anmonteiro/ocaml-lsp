@@ -10,13 +10,17 @@
   (enabled_if
    (= %{os_type} Unix))
   (deps
+   %{exe:fake_ocaml_merlin/fake_ocaml_merlin.exe}
    %{bin:ocaml-index}
    %{bin:ocamlformat-rpc}
+   %{bin:ocp-indent}
+   %{bin:ocp-indent-rpc}
    for_ppx.ml
    for_pp.ml
    (package ocaml-lsp-server)))
  (libraries
   unix
+  csexp
   stdune
   dune-rpc
   fiber
@@ -77,6 +81,7 @@
     infer_intf
     inlay_hints
     jump_to_typed_hole
+    merlin_configurations
     merlin_call_compatible
     destruct
     debug_echo
@@ -87,15 +92,21 @@
     dune_diagnostic_aggregation
     dune_diagnostic_conversion
     dune_diagnostics
+    dune_fake_diagnostics
     dune_formatting
     dune_nested_root
+    dune_progress
     dune_progress_lifecycle
     dune_promotion_disconnect
     dune_promotion_execute
     dune_promotion_open
+    dune_promotion_shared_source
     dune_registry_errors
     dune_workspace_removal
+    merlin_config_command
     metrics
+    ml_mli_mismatch_diagnostics
+    on_type_formatting
     refactor_extract
     registration_order
     semantic_hl_data

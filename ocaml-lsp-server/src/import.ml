@@ -95,10 +95,12 @@ end
    alphabetically. Try to keep the order. *)
 include struct
   open Lsp
+  module Deprecation = Deprecation
   module Client_notification = Client_notification
   module Client_request = Client_request
   module Server_request = Server_request
   module Text_document = Text_document
+  module Workspaces = Workspaces
 
   module Uri = struct
     module Uri = struct
@@ -180,20 +182,8 @@ end
    listed alphabetically. Try to keep the order. *)
 include struct
   open Lsp.Types
-
-  module ClientCapabilities = struct
-    include ClientCapabilities
-
-    let markdown_support (client_capabilities : ClientCapabilities.t) ~field =
-      match client_capabilities.textDocument with
-      | None -> false
-      | Some td ->
-        (match field td with
-         | Some (Some (MarkupKind.Markdown :: _)) -> true
-         | None | Some None | Some (Some _) -> false)
-    ;;
-  end
-
+  module Capabilities = Lsp.Capabilities
+  module ClientCapabilities = ClientCapabilities
   module CodeAction = CodeAction
   module CodeActionDisabled = CodeActionDisabled
   module CodeActionKind = CodeActionKind
@@ -227,10 +217,13 @@ include struct
   module DocumentHighlightKind = DocumentHighlightKind
   module DocumentHighlightParams = DocumentHighlightParams
   module DocumentSymbol = DocumentSymbol
+  module DocumentOnTypeFormattingOptions = DocumentOnTypeFormattingOptions
   module DocumentUri = DocumentUri
   module ExecuteCommandOptions = ExecuteCommandOptions
   module ExecuteCommandParams = ExecuteCommandParams
+  module Experimental = Lsp.Experimental
   module FoldingRange = FoldingRange
+  module FoldingRangeKind = FoldingRangeKind
   module FoldingRangeParams = FoldingRangeParams
   module Hover = Hover
   module HoverParams = HoverParams
@@ -255,6 +248,7 @@ include struct
   module PublishDiagnosticsParams = PublishDiagnosticsParams
   module PublishDiagnosticsClientCapabilities = PublishDiagnosticsClientCapabilities
   module ReferenceParams = ReferenceParams
+  module ResourceOperationKind = ResourceOperationKind
   module Registration = Registration
   module RegistrationParams = RegistrationParams
   module RenameOptions = RenameOptions
@@ -287,12 +281,15 @@ include struct
   module SignatureInformation = SignatureInformation
   module SymbolInformation = SymbolInformation
   module SymbolKind = SymbolKind
+  module SymbolTag = SymbolTag
   module TextDocumentClientCapabilities = TextDocumentClientCapabilities
   module TextDocumentContentChangeEvent = TextDocumentContentChangeEvent
   module TextDocumentContentChangePartial = TextDocumentContentChangePartial
   module TextDocumentContentChangeWholeDocument = TextDocumentContentChangeWholeDocument
   module TextDocumentEdit = TextDocumentEdit
   module TextDocumentFilter = TextDocumentFilter
+  module TextDocumentFilterLanguage = TextDocumentFilterLanguage
+  module TextDocumentFilterPattern = TextDocumentFilterPattern
   module TextDocumentIdentifier = TextDocumentIdentifier
   module TextDocumentItem = TextDocumentItem
   module TextDocumentRegistrationOptions = TextDocumentRegistrationOptions

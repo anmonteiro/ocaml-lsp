@@ -2,6 +2,17 @@ open Test.Import
 
 let print_locations = Test.print_option Locations.yojson_of_t
 
+let rec censor_backtraces = function
+  | `Assoc fields ->
+    `Assoc
+      (List.map fields ~f:(fun (name, value) ->
+         if String.equal name "backtrace"
+         then name, `String "<censored>"
+         else name, censor_backtraces value))
+  | `List values -> `List (List.map values ~f:censor_backtraces)
+  | json -> json
+;;
+
 let definition client position =
   let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
   Client.request
@@ -9,21 +20,15 @@ let definition client position =
     (TextDocumentDefinition (DefinitionParams.create ~textDocument ~position ()))
 ;;
 
-let print_definition_error label = function
-  | Error [ { Exn_with_backtrace.exn = Jsonrpc.Response.Error.E error; backtrace = _ } ]
-    ->
-    Printf.printf "%s: %s" label error.message;
-    Option.iter error.data ~f:(fun data ->
-      Printf.printf " (%s)" (Yojson.Safe.to_string data));
-    print_newline ();
+let print_definition_result label = function
+  | Ok locations ->
+    Printf.printf "%s: " label;
+    print_locations locations;
     Fiber.return ()
   | Error errors -> Fiber.reraise_all errors
-  | Ok _ ->
-    Printf.printf "%s unexpectedly succeeded\n" label;
-    Fiber.return ()
 ;;
 
-let%expect_test "reports definition lookup failures without stopping the server" =
+let%expect_test "reports no definition for lookup failures without stopping the server" =
   let source =
     "let origin = 1\n\
      let missing_use = missing\n\
@@ -34,7 +39,7 @@ let%expect_test "reports definition lookup failures without stopping the server"
   let req client =
     let check label position =
       let* result = Fiber.collect_errors (fun () -> definition client position) in
-      print_definition_error label result
+      print_definition_result label result
     in
     let* () = check "at origin" (Position.create ~line:0 ~character:4) in
     let* () = check "missing" (Position.create ~line:1 ~character:18) in
@@ -47,9 +52,9 @@ let%expect_test "reports definition lookup failures without stopping the server"
   Helpers.test source req;
   [%expect
     {|
-    at origin: Request "Jump to definition" failed. ("Locate: Already at definition point")
-    missing: Request "Jump to definition" failed. ("Locate: Not in environment: missing")
-    builtin: Request "Jump to definition" failed. ("Locate: \"int\" is a builtin, it is not possible to jump to its definition")
+    at origin: []
+    missing: []
+    builtin: []
     definition after errors:
     [
       {
@@ -60,6 +65,32 @@ let%expect_test "reports definition lookup failures without stopping the server"
         "uri": "file:///test.ml"
       }
     ]
+    |}]
+;;
+
+let%expect_test "definition of a nullary exception leaks Not_found" =
+  let source = "exception E\nE" in
+  Helpers.test source (fun client ->
+    let* result =
+      Fiber.collect_errors (fun () ->
+        definition client (Position.create ~line:1 ~character:1))
+    in
+    match result with
+    | Error [ { Exn_with_backtrace.exn = Jsonrpc.Response.Error.E error; backtrace = _ } ]
+      ->
+      Jsonrpc.Response.Error.yojson_of_t error |> censor_backtraces |> Test.print_result;
+      Fiber.return ()
+    | Error errors -> Fiber.reraise_all errors
+    | Ok response ->
+      print_locations response;
+      Fiber.return ());
+  [%expect
+    {|
+    {
+      "data": { "exn": "Not_found", "backtrace": "<censored>" },
+      "code": -32603,
+      "message": "uncaught exception"
+    }
     |}]
 ;;
 
@@ -89,4 +120,35 @@ let () =
       }
     ]
     |}]
+;;
+
+let%expect_test "definition on a non-Merlin document returns null" =
+  (Test.run_initialized
+   @@ fun client ->
+   let uri = DocumentUri.of_path "test.t" in
+   let text =
+     TextDocumentItem.create
+       ~uri
+       ~languageId:(LanguageKind.Other "cram")
+       ~version:0
+       ~text:"  $ echo hello\n"
+   in
+   let* () =
+     Client.notification
+       client
+       (TextDocumentDidOpen (DidOpenTextDocumentParams.create ~textDocument:text))
+   in
+   let textDocument = TextDocumentIdentifier.create ~uri in
+   let* response =
+     Client.request
+       client
+       (TextDocumentDefinition
+          (DefinitionParams.create
+             ~textDocument
+             ~position:(Position.create ~line:0 ~character:8)
+             ()))
+   in
+   print_locations response;
+   Test.shutdown_client client);
+  [%expect {| [] |}]
 ;;

@@ -106,15 +106,22 @@ $ make install
 ### Additional package installations
 
 - Install [ocamlformat](https://github.com/ocaml-ppx/ocamlformat#installation)
-  package if you want source file formatting support.
-
-  Note: To have source file formatting support in your project, there needs to
-  be an `.ocamlformat` file present in your project's root directory.
+  or [ocp-indent](https://github.com/OCamlPro/ocp-indent) if you want source file
+  formatting support. Configuration discovery walks from the document's
+  directory up to its containing workspace root, and the closest formatter
+  configuration wins. If a directory contains both `.ocamlformat` and
+  `.ocp-indent`, OCaml-LSP selects `ocamlformat`. With neither configuration, it
+  prefers `ocamlformat` when available and otherwise falls back to `ocp-indent`.
+  Unlike `ocamlformat`, `ocp-indent` only adjusts indentation.
 
 - OCaml-LSP also uses a program called `ocamlformat-rpc` to format code that is
   either generated or displayed by OCaml-LSP, e.g., when you hover over a module
   identifier, you can see its typed nicely formatted. This program comes with
   `ocamlformat` (version > 0.21.0). Previously, it was a standalone package.
+
+- Install the `ocp-indent-rpc` package to enable indentation as you type. The
+  server starts this helper lazily and keeps it running, so `ocp-indent` is not
+  executed separately for every keystroke.
 
 ## Usage
 
@@ -187,7 +194,7 @@ The server supports the following LSP requests (inexhaustive list):
 - [ ] `textDocument/colorPresentation`
 - [x] `textDocument/formatting`
 - [x] `textDocument/rangeFormatting`
-- [ ] `textDocument/onTypeFormatting`
+- [x] `textDocument/onTypeFormatting` (requires `ocp-indent-rpc`)
 - [x] `textDocument/prepareRename`
 - [x] `textDocument/foldingRange`
 - [x] `textDocument/selectionRange`

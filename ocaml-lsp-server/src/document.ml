@@ -199,6 +199,7 @@ type merlin =
   ; pipeline : Single_pipeline.t
   ; timer : Lev_fiber.Timer.Wheel.task
   ; merlin_config : Merlin_config.t
+  ; fixed_configuration : Merlin_config.configuration option
   ; syntax : Syntax.t
   ; kind : Kind.t option
   }
@@ -241,22 +242,10 @@ let make_merlin wheel merlin_db pipeline tdoc syntax =
   let uri = Text_document.documentUri tdoc in
   let path = Uri.to_path uri in
   let merlin_config = Merlin_config.DB.get merlin_db uri in
-  let* mconfig = Merlin_config.config merlin_config in
-  let kind =
-    let ext = Filename.extension path in
-    List.find_map mconfig.merlin.suffixes ~f:(fun (impl, intf) ->
-      if String.equal ext intf
-      then Some Kind.Intf
-      else if String.equal ext impl
-      then Some Kind.Impl
-      else None)
-  in
-  let kind =
-    match kind with
-    | Some _ as k -> k
-    | None -> Kind.of_fname_opt path
-  in
-  Fiber.return (Merlin { merlin_config; tdoc; pipeline; timer; syntax; kind })
+  let kind = Kind.of_fname_opt path in
+  Fiber.return
+    (Merlin
+       { merlin_config; fixed_configuration = None; tdoc; pipeline; timer; syntax; kind })
 ;;
 
 let make wheel config pipeline (doc : DidOpenTextDocumentParams.t) ~position_encoding =
@@ -300,25 +289,151 @@ let dune = function
 module Merlin = struct
   type t = merlin
 
+  type configuration_context =
+    { configurations : Merlin_config.configuration_set
+    ; kind : Kind.t
+    }
+
+  type 'a configured_result =
+    { configuration : Merlin_config.configuration
+    ; result : ('a, Exn_with_backtrace.t) result
+    }
+
   let to_doc t = Merlin t
   let source t = Msource.make (text (Merlin t))
   let timer (t : t) = t.timer
 
-  let kind t =
-    match t.kind with
-    | Some k -> k
-    | None -> Kind.unsupported (Text_document.documentUri t.tdoc)
+  let legacy_kind t config =
+    let path = Uri.to_path (Text_document.documentUri t.tdoc) in
+    let ext = Filename.extension path in
+    match
+      List.find_map config.Mconfig.merlin.suffixes ~f:(fun (impl, intf) ->
+        if String.equal ext intf
+        then Some Kind.Intf
+        else if String.equal ext impl
+        then Some Kind.Impl
+        else None)
+    with
+    | Some kind -> Ok kind
+    | None ->
+      (match Kind.of_fname_opt path with
+       | Some kind -> Ok kind
+       | None -> Error [ "unsupported file extension: " ^ ext ])
+  ;;
+
+  let kind (t : t) =
+    match t.fixed_configuration with
+    | Some { origin = Plural { kind = Implementation; _ }; _ } -> Kind.Impl
+    | Some { origin = Plural { kind = Interface; _ }; _ } -> Kind.Intf
+    | Some { origin = Legacy_file; config; _ } ->
+      (match legacy_kind t config with
+       | Ok kind -> kind
+       | Error _ -> Kind.unsupported (Text_document.documentUri t.tdoc))
+    | None ->
+      (match t.kind with
+       | Some kind -> kind
+       | None -> Kind.unsupported (Text_document.documentUri t.tdoc))
+  ;;
+
+  let plural_kind configurations =
+    let kinds =
+      Merlin_config.configuration_list configurations
+      |> List.filter_map ~f:(fun configuration ->
+        match configuration.Merlin_config.origin with
+        | Legacy_file -> None
+        | Plural { kind; _ } -> Some kind)
+    in
+    match kinds with
+    | [] -> None
+    | first :: rest ->
+      if List.for_all rest ~f:(fun kind -> kind = first)
+      then
+        Some
+          (Ok
+             (match first with
+              | Merlin_config.Implementation -> Kind.Impl
+              | Interface -> Kind.Intf))
+      else Some (Error [ "Merlin configurations disagree on the source kind" ])
+  ;;
+
+  let configuration_context_of_set t configurations =
+    let kind =
+      match plural_kind configurations with
+      | Some kind -> kind
+      | None -> legacy_kind t (Merlin_config.primary configurations).config
+    in
+    Result.map kind ~f:(fun kind -> { configurations; kind })
+  ;;
+
+  let configuration_context t =
+    match t.fixed_configuration with
+    | Some configuration ->
+      Fiber.return
+        (configuration_context_of_set t (Merlin_config.singleton configuration))
+    | None ->
+      let+ configurations = Merlin_config.configurations t.merlin_config in
+      Result.bind configurations ~f:(configuration_context_of_set t)
+  ;;
+
+  let configuration_context_exn t =
+    let+ context = configuration_context t in
+    match context with
+    | Ok context -> context
+    | Error messages ->
+      Jsonrpc.Response.Error.raise
+        (Jsonrpc.Response.Error.make
+           ~code:RequestFailed
+           ~message:(String.concat ~sep:"\n" messages)
+           ())
   ;;
 
   let with_pipeline ?name (t : t) f =
-    Single_pipeline.use ?name t.pipeline ~doc:t.tdoc ~config:t.merlin_config ~f
+    match t.fixed_configuration with
+    | None -> Single_pipeline.use ?name t.pipeline ~doc:t.tdoc ~config:t.merlin_config ~f
+    | Some configuration ->
+      Single_pipeline.use_with_config
+        ?name
+        t.pipeline
+        ~doc:t.tdoc
+        ~config:configuration.config
+        ~f
   ;;
 
   let with_configurable_pipeline ?name ~config (t : t) f =
     Single_pipeline.use_with_config ?name t.pipeline ~doc:t.tdoc ~config ~f
   ;;
 
-  let mconfig (t : t) = Merlin_config.config t.merlin_config
+  let with_configuration ?name (t : t) configuration f =
+    with_configurable_pipeline ?name ~config:configuration.Merlin_config.config t f
+  ;;
+
+  let with_configurations ?name (t : t) ~configurations f =
+    let rec loop acc = function
+      | [] -> Fiber.return (List.rev acc)
+      | configuration :: configurations ->
+        let name =
+          Option.map name ~f:(fun name ->
+            sprintf "%s (%s)" name (Merlin_config.configuration_label configuration))
+        in
+        let* result = with_configuration ?name t configuration (f configuration) in
+        loop ({ configuration; result } :: acc) configurations
+    in
+    match Merlin_config.configuration_list configurations with
+    | first :: rest ->
+      let+ results = loop [] (first :: rest) in
+      (match results with
+       | first :: rest -> Merlin_dot_protocol.Nonempty_list.create first rest
+       | [] -> invalid_arg "Document.Merlin.with_configurations")
+    | [] -> invalid_arg "Document.Merlin.with_configurations"
+  ;;
+
+  let mconfig (t : t) =
+    match t.fixed_configuration with
+    | None -> Merlin_config.config t.merlin_config
+    | Some configuration -> Fiber.return configuration.config
+  ;;
+
+  let fixed_configuration t = t.fixed_configuration
 
   let with_pipeline_exn ?name doc f =
     let+ res = with_pipeline ?name doc f in
@@ -340,6 +455,11 @@ module Merlin = struct
 
   let dispatch_exn ?name t command =
     with_pipeline_exn ?name t (fun pipeline -> Query_commands.dispatch pipeline command)
+  ;;
+
+  let dispatch_all ?name t ~configurations command =
+    with_configurations ?name t ~configurations (fun _ pipeline ->
+      Query_commands.dispatch pipeline command)
   ;;
 
   let doc_comment pipeline pos =
@@ -412,6 +532,12 @@ let merlin_exn t =
   | `Other -> invalid_arg ("Document.merlin_exn: " ^ DocumentUri.to_string @@ uri t)
 ;;
 
+let with_merlin_configuration t (configuration : Merlin_config.configuration) =
+  match t with
+  | Merlin merlin -> Merlin { merlin with fixed_configuration = Some configuration }
+  | Dune _ | Other _ -> t
+;;
+
 let close t =
   match t with
   | Dune _ | Other _ -> Fiber.return ()
@@ -422,6 +548,7 @@ let close t =
 ;;
 
 let get_impl_intf_counterparts m uri =
+  let uri = Source_path.uri uri in
   let fpath = Uri.to_path uri in
   let fname = Filename.basename fpath in
   let ml, mli, eliom, eliomi, re, rei, mll, mly, mlx =
@@ -468,5 +595,55 @@ let get_impl_intf_counterparts m uri =
       [ switch_to_fpath ]
     | to_switch_to -> to_switch_to
   in
-  List.map ~f:Uri.of_path files_to_switch_to
+  List.map ~f:Source_path.of_path files_to_switch_to
+;;
+
+let get_impl_intf_counterparts_for_configurations merlin configurations uri =
+  let uri = Source_path.uri uri in
+  let configured = Merlin_config.configuration_list configurations in
+  if
+    List.for_all configured ~f:(fun configuration ->
+      match configuration.Merlin_config.origin with
+      | Legacy_file -> true
+      | Plural _ -> false)
+  then get_impl_intf_counterparts (Some merlin) uri
+  else (
+    let exact =
+      List.filter_map configured ~f:(fun configuration ->
+        match configuration.Merlin_config.origin with
+        | Legacy_file -> None
+        | Plural { counterpart = None; _ } -> None
+        | Plural { counterpart = Some uri; _ } ->
+          let uri = Source_path.uri uri in
+          Option.some_if (Sys.file_exists (Uri.to_path uri)) uri)
+      |> List.fold_left ~init:[] ~f:(fun uris uri ->
+        if List.mem uris uri ~equal:Uri.equal then uris else uri :: uris)
+      |> List.rev
+    in
+    match exact with
+    | _ :: _ -> exact
+    | [] ->
+      let proposed =
+        List.map configured ~f:(fun configuration ->
+          match configuration.Merlin_config.origin with
+          | Legacy_file | Plural { counterpart = Some _; _ } -> None
+          | Plural { counterpart = None; kind; _ } ->
+            let path = Uri.to_path uri in
+            let extension = Filename.extension path in
+            let target_extension =
+              List.find_map configuration.config.merlin.suffixes ~f:(fun (impl, intf) ->
+                match kind with
+                | Implementation when String.equal extension impl -> Some intf
+                | Interface when String.equal extension intf -> Some impl
+                | Implementation | Interface -> None)
+            in
+            Option.bind target_extension ~f:(fun target_extension ->
+              let target = Filename.remove_extension path ^ target_extension in
+              Option.some_if (not (Sys.file_exists target)) (Source_path.of_path target)))
+      in
+      (match proposed with
+       | Some first :: rest
+         when List.for_all rest ~f:(fun candidate ->
+                Option.exists candidate ~f:(Uri.equal first)) -> [ first ]
+       | [] | _ -> []))
 ;;

@@ -4,16 +4,15 @@ module Diagnostics = Diagnostics
 module Position = Position
 module Doc_to_md = Doc_to_md
 module Diff = Diff
+
+module For_tests = struct
+  module Dune = Dune.For_tests
+end
+
 module Testing = Testing
 open Fiber.O
 
 let make_error = Jsonrpc.Response.Error.make
-
-let not_supported () =
-  Jsonrpc.Response.Error.raise
-    (make_error ~code:MethodNotFound ~message:"Request not supported yet!" ())
-;;
-
 let view_metrics_command_name = "ocamllsp/view-metrics"
 
 let view_metrics server =
@@ -26,8 +25,8 @@ let view_metrics server =
 
 let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeResult.t =
   let codeActionProvider =
-    match client_capabilities.textDocument with
-    | Some { codeAction = Some { codeActionLiteralSupport = Some _; _ }; _ } ->
+    match Capabilities.code_action_literal_support client_capabilities with
+    | Some _ ->
       let codeActionKinds =
         [ Action_destruct_line.kind
         ; Action_destruct.kind
@@ -51,7 +50,8 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
             ]
         |> List.dedup_and_sort ~compare:Poly.compare
       in
-      `CodeActionOptions (CodeActionOptions.create ~codeActionKinds ())
+      `CodeActionOptions
+        (CodeActionOptions.create ~codeActionKinds ~resolveProvider:true ())
     | _ -> `Bool true
   in
   let textDocumentSync =
@@ -95,6 +95,7 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
               ; Dune.view_promotion_capability
               ; Req_hover_extended.capability
               ; Req_merlin_call_compatible.capability
+              ; Req_merlin_configurations.capability
               ; Req_type_enclosing.capability
               ; Req_get_documentation.capability
               ; Req_construct.capability
@@ -111,11 +112,7 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
     in
     let executeCommandProvider =
       let commands =
-        if
-          Action_open_related.available
-            (let open Option.O in
-             let* window = client_capabilities.window in
-             window.showDocument)
+        if Action_open_related.available (Capabilities.show_document client_capabilities)
         then
           view_metrics_command_name
           :: Action_open_related.command_name
@@ -130,10 +127,9 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
     in
     let semanticTokensProvider =
       let open Option.O in
-      let* text_document = client_capabilities.textDocument in
-      let* semantic_tokens = text_document.semanticTokens in
+      let* semantic_tokens = Capabilities.semantic_tokens client_capabilities in
       let supports_relative =
-        List.mem semantic_tokens.formats Lsp.Types.TokenFormat.Relative ~equal:Poly.equal
+        Capabilities.supported semantic_tokens.formats ~tag:Relative ~equal:Poly.equal
       in
       let* full_request = semantic_tokens.requests.full in
       let* full =
@@ -157,12 +153,13 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
     in
     let positionEncoding =
       let open Option.O in
-      let* general = client_capabilities.general in
-      let* options = general.positionEncodings in
+      let* options = Capabilities.position_encodings client_capabilities in
       List.find_map
         ([ UTF8; UTF16 ] : PositionEncodingKind.t list)
         ~f:(fun encoding ->
-          Option.some_if (List.mem options ~equal:Poly.equal encoding) encoding)
+          Option.some_if
+            (Capabilities.supported options ~tag:encoding ~equal:Poly.equal)
+            encoding)
     in
     ServerCapabilities.create
       ~textDocumentSync
@@ -178,6 +175,8 @@ let initialize_info (client_capabilities : ClientCapabilities.t) : InitializeRes
       ~documentHighlightProvider:(`Bool true)
       ~documentFormattingProvider:(`Bool true)
       ~documentRangeFormattingProvider:(`Bool true)
+      ~documentOnTypeFormattingProvider:
+        (DocumentOnTypeFormattingOptions.create ~firstTriggerCharacter:"\n" ())
       ~selectionRangeProvider:(`Bool true)
       ~documentSymbolProvider:(`Bool true)
       ~workspaceSymbolProvider:(`Bool true)
@@ -205,6 +204,7 @@ let set_diagnostics detached diagnostics doc =
   match Document.kind doc with
   | `Other -> Fiber.return ()
   | `Merlin merlin ->
+    let generation = Diagnostics.begin_merlin_generation diagnostics uri in
     let async send =
       let+ () =
         task_if_running detached ~f:(fun () ->
@@ -228,7 +228,7 @@ let set_diagnostics detached diagnostics doc =
          in
          Diagnostic.create
            ~source:Diagnostics.ocamllsp_source
-           ~range:Lsp.Range.first_line
+           ~range:Range.first_line
            ~message
            ()
        in
@@ -236,22 +236,19 @@ let set_diagnostics detached diagnostics doc =
        async (fun () -> Diagnostics.send diagnostics (`One uri))
      | Reason | Ocaml | Mlx ->
        async (fun () ->
-         let* () = Diagnostics.merlin_diagnostics diagnostics merlin in
-         Diagnostics.send diagnostics (`One uri)))
+         let* current = Diagnostics.merlin_diagnostics diagnostics merlin ~generation in
+         if current then Diagnostics.send diagnostics (`One uri) else Fiber.return ()))
 ;;
 
 let register_dune_and_cram_text_document_sync server (capabilities : ClientCapabilities.t)
   =
-  match capabilities.textDocument with
-  | Some
-      { TextDocumentClientCapabilities.synchronization =
-          Some { TextDocumentSyncClientCapabilities.dynamicRegistration = Some true; _ }
-      ; _
-      } ->
+  if Capabilities.text_document_sync_dynamic_registration capabilities
+  then (
     let documentSelector =
       [ "cram"; "dune"; "dune-project"; "dune-workspace" ]
       |> List.map ~f:(fun language ->
-        `TextDocumentFilter (TextDocumentFilter.create ~language ()))
+        `TextDocumentFilter
+          (`TextDocumentFilterLanguage (TextDocumentFilterLanguage.create ~language ())))
     in
     let registerOptions =
       TextDocumentRegistrationOptions.create ~documentSelector ()
@@ -263,8 +260,8 @@ let register_dune_and_cram_text_document_sync server (capabilities : ClientCapab
     in
     let registrations = [ make "textDocument/didOpen"; make "textDocument/didClose" ] in
     let params = RegistrationParams.create ~registrations in
-    Server.request server (Server_request.ClientRegisterCapability params)
-  | _ -> Fiber.return ()
+    Server.request server (Server_request.ClientRegisterCapability params))
+  else Fiber.return ()
 ;;
 
 let on_initialize server (ip : InitializeParams.t) =
@@ -280,18 +277,16 @@ let on_initialize server (ip : InitializeParams.t) =
     Diagnostics.create
       ~report_dune_diagnostics
       ~shorten_merlin_diagnostics
-      (let open Option.O in
-       let* td = ip.capabilities.textDocument in
-       td.publishDiagnostics)
+      ip.capabilities
       (function
-        | [] -> Fiber.return ()
-        | diagnostics ->
-          let state = Server.state server in
-          task_if_running state.detached ~f:(fun () ->
-            let batch = Server.Batch.create server in
-            List.iter diagnostics ~f:(fun d ->
-              Server.Batch.notification batch (PublishDiagnostics d));
-            Server.Batch.submit batch))
+      | [] -> Fiber.return ()
+      | diagnostics ->
+        let state = Server.state server in
+        task_if_running state.detached ~f:(fun () ->
+          let batch = Server.Batch.create server in
+          List.iter diagnostics ~f:(fun d ->
+            Server.Batch.notification batch (PublishDiagnostics d));
+          Server.Batch.submit batch))
   in
   let+ dune =
     let progress =
@@ -394,20 +389,29 @@ module Formatter = struct
       Some (Diff.edit ~from:(Document.Dune.text doc) ~to_)
   ;;
 
+  let workspace_root rpc doc =
+    let state : State.t = Server.state rpc in
+    Workspaces.find_workspace_folder (State.workspaces state) (Document.uri doc)
+    |> Option.map ~f:(fun (folder : WorkspaceFolder.t) -> folder.uri)
+  ;;
+
   let run rpc doc =
     match Document.kind doc with
-    | `Merlin merlin -> run_ocamlformat rpc (Ocamlformat.run merlin)
+    | `Merlin merlin ->
+      let workspace_root = workspace_root rpc doc in
+      run_ocamlformat rpc (Ocamlformat.run ~workspace_root merlin)
     | `Other ->
       (match Document.dune doc with
-       | Some dune -> run_dune rpc dune
-       | None -> Fiber.return None)
+       | None -> Fiber.return None
+       | Some dune -> run_dune rpc dune)
   ;;
 
   let run_on_range rpc doc range =
     match Document.syntax doc with
     | Dune | Cram -> Fiber.return None
     | Ocaml | Reason | Mlx | Ocamllex | Menhir ->
-      run_ocamlformat rpc (Ocamlformat.run_on_range doc range)
+      let workspace_root = workspace_root rpc doc in
+      Ocamlformat.run_on_range ~workspace_root doc range |> run_ocamlformat rpc
   ;;
 end
 
@@ -420,27 +424,103 @@ let text_document_lens
   let doc = Document_store.get store uri in
   match Document.kind doc with
   | `Other -> Fiber.return []
-  | `Merlin m when Document.Merlin.kind m = Intf -> Fiber.return []
   | `Merlin doc ->
-    let+ outline = Document.Merlin.dispatch_exn ~name:"outline" doc Outline in
-    let rec symbol_info_of_outline_item (item : Query_protocol.item) =
-      let children =
-        if for_nested_bindings
-        then List.concat_map item.children ~f:symbol_info_of_outline_item
-        else []
-      in
-      match item.outline_type with
-      | None -> children
-      | Some typ ->
-        let loc = item.location in
-        let info =
-          let range = Range.of_loc loc in
-          let command = Command.create ~title:typ ~command:"" () in
-          CodeLens.create ~range ~command ()
-        in
-        info :: children
+    let* { Document.Merlin.configurations; kind } =
+      Document.Merlin.configuration_context_exn doc
     in
-    List.concat_map ~f:symbol_info_of_outline_item outline
+    if kind = Intf
+    then Fiber.return []
+    else
+      let+ configured =
+        Document.Merlin.dispatch_all ~name:"outline" doc ~configurations Outline
+      in
+      let rec symbol_info_of_outline_item (item : Query_protocol.item) =
+        let children =
+          if for_nested_bindings
+          then List.concat_map item.children ~f:symbol_info_of_outline_item
+          else []
+        in
+        match item.outline_type with
+        | None -> children
+        | Some typ ->
+          let loc = item.location in
+          let info =
+            let range = Range.of_loc loc in
+            let command = Command.create ~title:typ ~command:"" () in
+            CodeLens.create ~range ~command ()
+          in
+          info :: children
+      in
+      let lenses, failures, successes =
+        Merlin_dot_protocol.Nonempty_list.to_list configured
+        |> List.fold_left
+             ~init:([], [], 0)
+             ~f:
+               (fun
+                 (lenses, failures, successes)
+                 ({ configuration; result } : _ Document.Merlin.configured_result)
+               ->
+               match result with
+               | Error error -> lenses, (configuration, error) :: failures, successes
+               | Ok outline ->
+                 let found = List.concat_map ~f:symbol_info_of_outline_item outline in
+                 ( List.rev_append
+                     (List.map found ~f:(fun lens -> configuration, lens))
+                     lenses
+                 , failures
+                 , successes + 1 ))
+      in
+      List.iter failures ~f:(fun (configuration, error) ->
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            "Merlin code lens configuration failed"
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]));
+      if successes = 0
+      then (
+        let primary = Merlin_config.primary configurations in
+        match
+          List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        with
+        | Some (_, error) -> Exn_with_backtrace.reraise error
+        | None -> invalid_arg "configured code lens query had no result");
+      let rec add_lens configuration lens = function
+        | [] -> [ lens, [ configuration ] ]
+        | (candidate, contributors) :: rest ->
+          if Poly.equal lens candidate
+          then (
+            let contributors =
+              if
+                List.exists contributors ~f:(fun contributor ->
+                  contributor == configuration)
+              then contributors
+              else configuration :: contributors
+            in
+            (candidate, contributors) :: rest)
+          else (candidate, contributors) :: add_lens configuration lens rest
+      in
+      let groups =
+        List.fold_left (List.rev lenses) ~init:[] ~f:(fun groups (configuration, lens) ->
+          add_lens configuration lens groups)
+      in
+      let all_configurations = Merlin_config.configuration_list configurations in
+      List.map groups ~f:(fun (lens, contributors) ->
+        if List.length contributors = List.length all_configurations
+        then lens
+        else (
+          let labels =
+            List.filter all_configurations ~f:(fun configuration ->
+              List.exists contributors ~f:(fun contributor ->
+                contributor == configuration))
+            |> List.map ~f:Merlin_config.configuration_label
+            |> String.concat ~sep:", "
+          in
+          let command =
+            Option.map lens.CodeLens.command ~f:(fun command ->
+              { command with title = command.title ^ " (" ^ labels ^ ")" })
+          in
+          { lens with command }))
 ;;
 
 let selection_range
@@ -451,77 +531,244 @@ let selection_range
   match Document.kind doc with
   | `Other -> Fiber.return []
   | `Merlin merlin ->
-    let selection_range_of_enclosings (enclosings : Warnings.loc list)
-      : SelectionRange.t option
-      =
-      let ranges_of_enclosing parent (enclosing : Warnings.loc) =
-        let range = Range.of_loc enclosing in
-        { SelectionRange.range; parent }
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
+    (* TODO: Convert selection-range inputs and outputs using the negotiated
+       position encoding instead of Merlin's UTF-8 byte columns. *)
+    let source = Document.Merlin.source merlin in
+    let ranges_for_position position enclosings =
+      List.filter_map enclosings ~f:(fun enclosing ->
+        let range = Range.clamp_to_source (Range.of_loc enclosing) source in
+        Option.some_if (Range.contains_position range position ~inclusive_end:true) range)
+    in
+    let selection_range_of_ranges position ranges =
+      List.rev ranges
+      |> List.fold_left ~init:None ~f:(fun parent range ->
+        Some { SelectionRange.range; parent })
+      |> Option.value
+           ~default:
+             { SelectionRange.range = { start = position; end_ = position }
+             ; parent = None
+             }
+    in
+    let+ configured =
+      Document.Merlin.with_configurations
+        ~name:"shape"
+        merlin
+        ~configurations
+        (fun _ pipeline ->
+           List.map positions ~f:(fun position ->
+             Query_commands.dispatch
+               pipeline
+               (Enclosing (Position.logical position, None))))
+    in
+    let failures =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.filter_map
+           ~f:(fun ({ configuration; result } : _ Document.Merlin.configured_result) ->
+             Result.error result |> Option.map ~f:(fun error -> configuration, error))
+    in
+    if not (List.is_empty failures)
+    then (
+      List.iter failures ~f:(fun (configuration, error) ->
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            "Merlin selection range configuration failed"
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]));
+      let modes =
+        List.map failures ~f:(fun (configuration, _) ->
+          Merlin_config.configuration_label configuration)
+        |> String.concat ~sep:", "
       in
-      List.fold_left
-        ~f:(fun parent enclosing -> Some (ranges_of_enclosing parent enclosing))
-        ~init:None
-      @@ List.rev enclosings
+      Jsonrpc.Response.Error.raise
+        (Jsonrpc.Response.Error.make
+           ~code:RequestFailed
+           ~message:("Selection range failed for configurations: " ^ modes)
+           ()));
+    let all_enclosings =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.map ~f:(fun ({ result; _ } : _ Document.Merlin.configured_result) ->
+        match result with
+        | Ok value -> value
+        | Error _ -> invalid_arg "failed selection range survived validation")
     in
-    let+ ranges =
-      Fiber.sequential_map positions ~f:(fun x ->
-        let+ enclosings =
-          Document.Merlin.dispatch_exn
-            ~name:"shape"
-            merlin
-            (Enclosing (Position.logical x, None))
-        in
-        selection_range_of_enclosings enclosings)
-    in
-    List.filter_opt ranges
+    List.mapi positions ~f:(fun index position ->
+      let chains =
+        List.map all_enclosings ~f:(fun per_position ->
+          List.nth_exn per_position index |> ranges_for_position position)
+      in
+      let primary_chain = List.hd_exn chains in
+      let common =
+        List.filter primary_chain ~f:(fun range ->
+          List.for_all (List.tl_exn chains) ~f:(fun chain ->
+            List.exists chain ~f:(Poly.equal range)))
+      in
+      selection_range_of_ranges position common)
 ;;
 
 let references
       rpc
       (state : State.t)
-      { ReferenceParams.textDocument = { uri }; position; _ }
+      { ReferenceParams.textDocument = { uri }; position; context; _ }
   =
   let doc = Document_store.get state.store uri in
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin doc ->
-    let* occurrences, synced =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn doc
+    in
+    let* configured =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         doc
+        ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Project))
     in
+    let locations, out_of_sync, failures, successes =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.fold_left
+           ~init:([], [], [], 0)
+           ~f:
+             (fun
+               (locations, out_of_sync, failures, successes)
+               ({ configuration; result } : _ Document.Merlin.configured_result)
+             ->
+             match result with
+             | Error error ->
+               locations, out_of_sync, (configuration, error) :: failures, successes
+             | Ok (occurrences, synced) ->
+               let out_of_sync =
+                 match synced with
+                 | `Out_of_sync _ -> configuration :: out_of_sync
+                 | _ -> out_of_sync
+               in
+               let found =
+                 List.filter_map
+                   occurrences
+                   ~f:(fun ({ loc; is_stale } : Query_protocol.occurrence) ->
+                     if is_stale
+                     then None
+                     else (
+                       let range = Range.of_loc loc in
+                       let target_uri =
+                         match loc.loc_start.pos_fname with
+                         | "" -> uri
+                         | path -> Source_path.of_path path
+                       in
+                       Some (Source_path.location { Location.uri = target_uri; range })))
+               in
+               List.rev_append found locations, out_of_sync, failures, successes + 1)
+    in
+    List.iter failures ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          "Merlin occurrences configuration failed"
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    if successes = 0
+    then (
+      let primary = Merlin_config.primary configurations in
+      let _, error =
+        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        |> Option.value ~default:(List.hd_exn failures)
+      in
+      Exn_with_backtrace.reraise error);
+    let* declarations =
+      if context.includeDeclaration
+      then Fiber.return []
+      else
+        let* configured =
+          Document.Merlin.dispatch_all
+            ~name:"reference-declaration"
+            doc
+            ~configurations
+            (Locate (None, `ML, Position.logical position))
+        in
+        let declarations, failures, successes =
+          Merlin_dot_protocol.Nonempty_list.to_list configured
+          |> List.fold_left
+               ~init:([], [], 0)
+               ~f:
+                 (fun
+                   (declarations, failures, successes)
+                   ({ configuration; result } : _ Document.Merlin.configured_result)
+                 ->
+                 match result with
+                 | Error error ->
+                   declarations, (configuration, error) :: failures, successes
+                 | Ok result ->
+                   let declaration =
+                     match result with
+                     | `At_origin -> Some (`At_origin (Source_path.uri uri, position))
+                     | `Found (path, lexical_position) ->
+                       Position.of_lexical_position lexical_position
+                       |> Option.map ~f:(fun position ->
+                         let uri =
+                           Option.value_map
+                             path
+                             ~default:(Source_path.uri uri)
+                             ~f:Source_path.of_path
+                         in
+                         `Found (uri, position))
+                     | `Builtin _
+                     | `File_not_found _
+                     | `Invalid_context
+                     | `Not_found _
+                     | `Not_in_env _ -> None
+                   in
+                   Option.to_list declaration @ declarations, failures, successes + 1)
+        in
+        List.iter failures ~f:(fun (configuration, error) ->
+          Log.log ~section:"merlin" (fun () ->
+            Log.msg
+              "Merlin reference declaration configuration failed"
+              [ "mode", `String (Merlin_config.configuration_label configuration)
+              ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+              ]));
+        if successes = 0
+        then (
+          let primary = Merlin_config.primary configurations in
+          let _, error =
+            List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+            |> Option.value ~default:(List.hd_exn failures)
+          in
+          Exn_with_backtrace.reraise error);
+        Fiber.return declarations
+    in
     let+ () =
-      match synced with
-      | `Out_of_sync _ ->
+      match out_of_sync with
+      | _ :: _ ->
         let msg =
           let message =
             "The index might be out-of-sync.  If you use Dune you can build the target \
-             `@ocaml-index` to refresh the index."
+             `@ocaml-index` to refresh the index. Affected configurations: "
+            ^ String.concat
+                ~sep:", "
+                (List.rev_map out_of_sync ~f:Merlin_config.configuration_label)
           in
           ShowMessageParams.create ~message ~type_:Warning
         in
         task_if_running state.detached ~f:(fun () ->
           Server.notification rpc (ShowMessage msg))
-      | _ -> Fiber.return ()
+      | [] -> Fiber.return ()
     in
-    Some
-      (List.filter_map occurrences ~f:(function
-         | { loc = _; is_stale = true } -> None
-         | { loc; is_stale = false } ->
-           let range = Range.of_loc loc in
-           let uri =
-             match loc.loc_start.pos_fname with
-             | "" -> uri
-             | path -> Uri.of_path path
-           in
-           Log.log ~section:"debug" (fun () ->
-             Log.msg
-               "merlin returned fname %a"
-               [ "pos_fname", `String loc.loc_start.pos_fname
-               ; "uri", `String (Uri.to_string uri)
-               ]);
-           Some { Location.uri; range }))
+    let is_declaration ({ Location.uri; range } : Location.t) =
+      List.exists declarations ~f:(function
+        | `At_origin (declaration_uri, position) ->
+          Uri.equal uri declaration_uri
+          && Range.contains_position range position ~inclusive_end:true
+        | `Found (declaration_uri, position) ->
+          Uri.equal uri declaration_uri && Position.compare range.start position = 0)
+    in
+    List.rev locations
+    |> List.filter ~f:(Fn.non is_declaration)
+    |> Source_path.deduplicate_locations
+    |> Option.some
 ;;
 
 let highlight
@@ -533,26 +780,60 @@ let highlight
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin m ->
-    let+ occurrences, _synced =
-      Document.Merlin.dispatch_exn
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn m
+    in
+    let+ configured =
+      Document.Merlin.dispatch_all
         ~name:"occurrences"
         m
+        ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Buffer))
     in
-    let lsp_locs =
-      List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
-        let loc = occurrence.loc in
-        let range = Range.of_loc loc in
-        (* filter out multi-line ranges, since those are very noisy and happen
-           a lot with certain PPXs *)
-        match Lsp.Range.is_single_line range with
-        | true ->
-          (* using the default kind as we are lacking info to make a
-             difference between assignment and usage. *)
-          Some (DocumentHighlight.create ~range ~kind:DocumentHighlightKind.Text ())
-        | false -> None)
+    let lsp_locs, failures, successes =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.fold_left
+           ~init:([], [], 0)
+           ~f:
+             (fun
+               (locations, failures, successes)
+               ({ configuration; result } : _ Document.Merlin.configured_result)
+             ->
+             match result with
+             | Error error -> locations, (configuration, error) :: failures, successes
+             | Ok (occurrences, _synced) ->
+               let found =
+                 List.filter_map
+                   occurrences
+                   ~f:(fun (occurrence : Query_protocol.occurrence) ->
+                     let range = Range.of_loc occurrence.loc in
+                     if Lsp.Range.is_single_line range
+                     then
+                       Some
+                         (DocumentHighlight.create
+                            ~range
+                            ~kind:DocumentHighlightKind.Text
+                            ())
+                     else None)
+               in
+               List.rev_append found locations, failures, successes + 1)
     in
-    Some lsp_locs
+    List.iter failures ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          "Merlin highlight configuration failed"
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    if successes = 0
+    then (
+      let primary = Merlin_config.primary configurations in
+      let _, error =
+        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        |> Option.value ~default:(List.hd_exn failures)
+      in
+      Exn_with_backtrace.reraise error);
+    Some (List.dedup_and_sort ~compare:Poly.compare lsp_locs)
 ;;
 
 let document_symbol (state : State.t) uri =
@@ -584,14 +865,12 @@ let on_request
   | Client_request.UnknownRequest { meth; params } ->
     (match
        List.Assoc.find
-         [ ( Req_switch_impl_intf.meth
-           , fun ~params state ->
-               Fiber.of_thunk (fun () ->
-                 Fiber.return (Req_switch_impl_intf.on_request ~params state)) )
+         [ Req_switch_impl_intf.meth, Req_switch_impl_intf.on_request
          ; Req_infer_intf.meth, Req_infer_intf.on_request
          ; Req_typed_holes.meth, Req_typed_holes.on_request
          ; Req_jump_to_typed_hole.meth, Req_jump_to_typed_hole.on_request
          ; Req_merlin_call_compatible.meth, Req_merlin_call_compatible.on_request
+         ; Req_merlin_configurations.meth, Req_merlin_configurations.on_request
          ; Req_type_enclosing.meth, Req_type_enclosing.on_request
          ; Req_get_documentation.meth, Req_get_documentation.on_request
          ; Req_merlin_jump.meth, Req_merlin_jump.on_request
@@ -634,8 +913,13 @@ let on_request
      | Some doc -> now (Some (Msource.text (Document.source doc))))
   | DebugEcho params -> now params
   | Shutdown -> Fiber.return (Reply.now (), state)
-  | WorkspaceSymbol req -> later (fun state () -> Workspace_symbol.run state req) ()
-  | CodeActionResolve ca -> now ca
+  | WorkspaceSymbol req ->
+    later
+      (fun state () ->
+         Workspace_symbol.run state req
+         >>| Option.map ~f:(fun symbols -> `SymbolInformation symbols))
+      ()
+  | CodeActionResolve ca -> later (fun state () -> Code_actions.resolve state ca) ()
   | ExecuteCommand command ->
     if String.equal command.command Merlin_config_command.command_name
     then
@@ -672,13 +956,9 @@ let on_request
     later
       (fun state () ->
          let markdown =
-           ClientCapabilities.markdown_support
-             (State.client_capabilities state)
-             ~field:(fun d ->
-               let open Option.O in
-               let+ completion = d.completion in
-               let* completion_item = completion.completionItem in
-               completion_item.documentationFormat)
+           Capabilities.supports_markdown
+             (Capabilities.completion_documentation_format
+                (State.client_capabilities state))
          in
          let resolve = Compl.Resolve.of_completion_item ci in
          match resolve with
@@ -690,13 +970,7 @@ let on_request
            in
            (match Document.kind doc with
             | `Other -> Fiber.return ci
-            | `Merlin doc ->
-              Compl.resolve
-                doc
-                ci
-                resolve
-                (Document.Merlin.doc_comment ~name:"completion-resolve")
-                ~markdown))
+            | `Merlin doc -> Compl.resolve state doc ci resolve ~markdown))
       ()
   | CodeAction params -> Code_actions.compute server params
   | InlayHint params -> later (fun state () -> Inlay_hints.compute state params) ()
@@ -717,8 +991,12 @@ let on_request
   | TextDocumentCodeLens req ->
     (match state.configuration.data.codelens with
      | Some { enable = true; for_nested_bindings } ->
-       later (text_document_lens ~for_nested_bindings) req
-     | _ -> now [])
+       later
+         (fun state req ->
+            let+ result = text_document_lens ~for_nested_bindings state req in
+            Some result)
+         req
+     | _ -> now (Some []))
   | TextDocumentHighlight req -> later highlight req
   | DocumentSymbol { textDocument = { uri }; _ } -> later document_symbol uri
   | TextDocumentDeclaration { textDocument = { uri }; position; _ } ->
@@ -734,9 +1012,19 @@ let on_request
          let+ result = Rename.prepare state req in
          Option.map result ~f:(fun range -> `Range range))
       req
-  | TextDocumentRename req -> later Rename.rename req
+  | TextDocumentRename req ->
+    later
+      (fun state req ->
+         let+ result = Rename.rename state req in
+         Some result)
+      req
   | TextDocumentFoldingRange req -> later Folding_range.compute req
-  | SignatureHelp req -> later Signature_help.run req
+  | SignatureHelp req ->
+    later
+      (fun state req ->
+         let+ result = Signature_help.run state req in
+         Some result)
+      req
   | TextDocumentLinkResolve l -> now l
   | TextDocumentLink _ -> now None
   | WillSaveWaitUntilTextDocument _ -> now None
@@ -752,31 +1040,44 @@ let on_request
          let doc = Document_store.get store uri in
          Formatter.run_on_range rpc doc range)
       ()
-  | TextDocumentOnTypeFormatting _ -> now None
-  | SelectionRange req -> later selection_range req
-  | TextDocumentImplementation _ -> not_supported ()
+  | TextDocumentOnTypeFormatting { textDocument = { uri }; position; ch; _ } ->
+    (match ch with
+     | "\n" ->
+       later
+         (fun state () ->
+            let doc = Document_store.get store uri in
+            Ocp_indent.format_on_type state.ocp_indent doc position)
+         ()
+     | _ -> now (Some []))
+  | SelectionRange req ->
+    later
+      (fun state req ->
+         let+ result = selection_range state req in
+         Some result)
+      req
+  | TextDocumentImplementation _ -> Server.not_supported ()
   | SemanticTokensFull p -> later Semantic_highlighting.on_request_full p
   | SemanticTokensDelta p -> later Semantic_highlighting.on_request_full_delta p
-  | TextDocumentMoniker _ -> not_supported ()
-  | TextDocumentPrepareCallHierarchy _ -> not_supported ()
-  | CallHierarchyIncomingCalls _ -> not_supported ()
-  | CallHierarchyOutgoingCalls _ -> not_supported ()
-  | SemanticTokensRange _ -> not_supported ()
-  | LinkedEditingRange _ -> not_supported ()
-  | WillCreateFiles _ -> not_supported ()
-  | WillRenameFiles _ -> not_supported ()
-  | WillDeleteFiles _ -> not_supported ()
-  | InlayHintResolve _ -> not_supported ()
-  | TextDocumentDiagnostic _ -> not_supported ()
-  | TextDocumentInlineCompletion _ -> not_supported ()
-  | TextDocumentInlineValue _ -> not_supported ()
-  | WorkspaceSymbolResolve _ -> not_supported ()
-  | WorkspaceDiagnostic _ -> not_supported ()
-  | TextDocumentRangesFormatting _ -> not_supported ()
-  | TextDocumentPrepareTypeHierarchy _ -> not_supported ()
-  | TypeHierarchySupertypes _ -> not_supported ()
-  | TypeHierarchySubtypes _ -> not_supported ()
-  | WorkspaceTextDocumentContent _ -> not_supported ()
+  | TextDocumentMoniker _ -> Server.not_supported ()
+  | TextDocumentPrepareCallHierarchy _ -> Server.not_supported ()
+  | CallHierarchyIncomingCalls _ -> Server.not_supported ()
+  | CallHierarchyOutgoingCalls _ -> Server.not_supported ()
+  | SemanticTokensRange _ -> Server.not_supported ()
+  | LinkedEditingRange _ -> Server.not_supported ()
+  | WillCreateFiles _ -> Server.not_supported ()
+  | WillRenameFiles _ -> Server.not_supported ()
+  | WillDeleteFiles _ -> Server.not_supported ()
+  | InlayHintResolve _ -> Server.not_supported ()
+  | TextDocumentDiagnostic _ -> Server.not_supported ()
+  | TextDocumentInlineCompletion _ -> Server.not_supported ()
+  | TextDocumentInlineValue _ -> Server.not_supported ()
+  | WorkspaceSymbolResolve _ -> Server.not_supported ()
+  | WorkspaceDiagnostic _ -> Server.not_supported ()
+  | TextDocumentRangesFormatting _ -> Server.not_supported ()
+  | TextDocumentPrepareTypeHierarchy _ -> Server.not_supported ()
+  | TypeHierarchySupertypes _ -> Server.not_supported ()
+  | TypeHierarchySubtypes _ -> Server.not_supported ()
+  | WorkspaceTextDocumentContent _ -> Server.not_supported ()
 ;;
 
 let on_notification server (notification : Client_notification.t) : State.t Fiber.t =
@@ -839,7 +1140,12 @@ let on_notification server (notification : Client_notification.t) : State.t Fibe
             | `Merlin _, Reason when Option.is_none (Bin.which ocamlmerlin_reason) ->
               Fiber.return ()
             | `Merlin merlin, (Reason | Ocaml | Mlx) ->
-              Diagnostics.merlin_diagnostics diagnostics merlin
+              let uri = Document.Merlin.to_doc merlin |> Document.uri in
+              let generation = Diagnostics.begin_merlin_generation diagnostics uri in
+              let+ (_ : bool) =
+                Diagnostics.merlin_diagnostics diagnostics merlin ~generation
+              in
+              ()
             | `Merlin _, (Dune | Cram | Menhir | Ocamllex) -> assert false)
         in
         Diagnostics.send diagnostics `All
@@ -896,6 +1202,7 @@ let start stream =
     Server.Handler.make ~on_request ~on_notification ()
   in
   let ocamlformat_rpc = Ocamlformat_rpc.create () in
+  let ocp_indent = Ocp_indent.create () in
   let* configuration = Configuration.default () in
   let wheel = Configuration.wheel configuration in
   let* merlin = Lev_fiber.Thread.create () in
@@ -910,6 +1217,7 @@ let start stream =
             ~store
             ~merlin
             ~ocamlformat_rpc
+            ~ocp_indent
             ~configuration
             ~detached
             ~symbols_thread
@@ -959,6 +1267,7 @@ let start stream =
         [ Document_store.close_all store
         ; Fiber.Pool.stop detached
         ; Ocamlformat_rpc.stop ocamlformat_rpc
+        ; Ocp_indent.stop ocp_indent
         ; Lev_fiber.Timer.Wheel.stop wheel
         ; Merlin_config.DB.stop state.merlin_config
         ; Fiber.of_thunk (fun () ->

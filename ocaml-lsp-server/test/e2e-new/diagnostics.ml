@@ -5,7 +5,7 @@ let print_diagnostics params =
   PublishDiagnosticsParams.yojson_of_t params |> Test.print_result
 ;;
 
-let test ?(print = print_diagnostics) source =
+let test ?(print = print_diagnostics) ?capabilities source =
   let diagnostics = Fiber.Ivar.create () in
   let handler =
     Client.Handler.make
@@ -18,7 +18,7 @@ let test ?(print = print_diagnostics) source =
          | _ -> Fiber.return ())
       ()
   in
-  Test.run_initialized ~handler (fun client ->
+  Test.run_initialized ~handler ?capabilities (fun client ->
     let textDocument =
       TextDocumentItem.create
         ~uri:Helpers.uri
@@ -92,6 +92,16 @@ let%expect_test "has related diagnostics" =
     |}]
 ;;
 
+let tag_capabilities =
+  let tagSupport =
+    ClientDiagnosticsTagOptions.create
+      ~valueSet:[ DiagnosticTag.Unnecessary; DiagnosticTag.Deprecated ]
+  in
+  let publishDiagnostics = PublishDiagnosticsClientCapabilities.create ~tagSupport () in
+  let textDocument = TextDocumentClientCapabilities.create ~publishDiagnostics () in
+  ClientCapabilities.create ~textDocument ()
+;;
+
 let%expect_test "unused values have diagnostic tags" =
   let source =
     {ocaml|let () =
@@ -99,7 +109,7 @@ let%expect_test "unused values have diagnostic tags" =
   ()
 |ocaml}
   in
-  test source;
+  test ~capabilities:tag_capabilities source;
   [%expect
     {|
     textDocument/publishDiagnostics
@@ -112,7 +122,8 @@ let%expect_test "unused values have diagnostic tags" =
             "start": { "character": 6, "line": 1 }
           },
           "severity": 2,
-          "source": "ocamllsp"
+          "source": "ocamllsp",
+          "tags": [ 1 ]
         }
       ],
       "uri": "file:///test.ml"
@@ -131,7 +142,7 @@ end
 let () = ignore X.x
 |ocaml}
   in
-  test source;
+  test ~capabilities:tag_capabilities source;
   [%expect
     {|
     textDocument/publishDiagnostics
@@ -144,7 +155,8 @@ let () = ignore X.x
             "start": { "character": 16, "line": 6 }
           },
           "severity": 2,
-          "source": "ocamllsp"
+          "source": "ocamllsp",
+          "tags": [ 2 ]
         }
       ],
       "uri": "file:///test.ml"
@@ -422,6 +434,105 @@ let%expect_test "different diagnostics, including holes, sorted by range" =
             "end": { "character": 9, "line": 5 },
             "start": { "character": 6, "line": 5 }
           },
+          "severity": 1,
+          "source": "ocamllsp"
+        }
+      ],
+      "uri": "file:///test.ml"
+    }
+    |}]
+;;
+
+let related_information_capabilities =
+  let publishDiagnostics =
+    PublishDiagnosticsClientCapabilities.create ~relatedInformation:true ()
+  in
+  let textDocument = TextDocumentClientCapabilities.create ~publishDiagnostics () in
+  ClientCapabilities.create ~textDocument ()
+;;
+
+let%expect_test "related information from raw locations in the message" =
+  let source =
+    {ocaml|module X : sig
+  val x : unit
+end = struct
+  let x = 123
+end
+|ocaml}
+  in
+  test ~capabilities:related_information_capabilities source;
+  [%expect
+    {|
+    textDocument/publishDiagnostics
+    {
+      "diagnostics": [
+        {
+          "message": "Signature mismatch:\nModules do not match:\n  sig val x : int end\nis not included in\n  sig val x : unit end\nValues do not match: val x : int is not included in val x : unit\nThe type int is not compatible with the type unit",
+          "range": {
+            "end": { "character": 3, "line": 4 },
+            "start": { "character": 6, "line": 2 }
+          },
+          "relatedInformation": [
+            {
+              "location": {
+                "range": {
+                  "end": { "character": 14, "line": 1 },
+                  "start": { "character": 2, "line": 1 }
+                },
+                "uri": "file:///test.ml"
+              },
+              "message": "Expected declaration"
+            },
+            {
+              "location": {
+                "range": {
+                  "end": { "character": 7, "line": 3 },
+                  "start": { "character": 6, "line": 3 }
+                },
+                "uri": "file:///test.ml"
+              },
+              "message": "Actual declaration"
+            }
+          ],
+          "severity": 1,
+          "source": "ocamllsp"
+        }
+      ],
+      "uri": "file:///test.ml"
+    }
+    |}]
+;;
+
+let%expect_test "related information for structured sub-errors" =
+  let source =
+    {ocaml|let f x = x + 1
+let () = f 1 2
+|ocaml}
+  in
+  test ~capabilities:related_information_capabilities source;
+  [%expect
+    {|
+    textDocument/publishDiagnostics
+    {
+      "diagnostics": [
+        {
+          "message": "The function f has type int -> int\nIt is applied to too many arguments",
+          "range": {
+            "end": { "character": 14, "line": 1 },
+            "start": { "character": 9, "line": 1 }
+          },
+          "relatedInformation": [
+            {
+              "location": {
+                "range": {
+                  "end": { "character": 14, "line": 1 },
+                  "start": { "character": 13, "line": 1 }
+                },
+                "uri": "file:///test.ml"
+              },
+              "message": "This extra argument is not expected."
+            }
+          ],
           "severity": 1,
           "source": "ocamllsp"
         }

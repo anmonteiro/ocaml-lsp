@@ -3,10 +3,20 @@ open Import
 val ocamllsp_source : string
 val dune_source : string
 
+module Provenance : sig
+  type classification =
+    [ `External
+    | `Malformed
+    | `Modes of string list
+    ]
+
+  val classify : Diagnostic.t -> classification
+end
+
 type t
 
 val create
-  :  PublishDiagnosticsClientCapabilities.t option
+  :  ClientCapabilities.t
   -> (PublishDiagnosticsParams.t list -> unit Fiber.t)
   -> report_dune_diagnostics:bool
   -> shorten_merlin_diagnostics:bool
@@ -36,7 +46,8 @@ val tags_of_message
   -> string
   -> DiagnosticTag.t list option
 
-val merlin_diagnostics : t -> Document.Merlin.t -> unit Fiber.t
+val begin_merlin_generation : t -> Uri.t -> int
+val merlin_diagnostics : t -> Document.Merlin.t -> generation:int -> bool Fiber.t
 val set_report_dune_diagnostics : t -> report_dune_diagnostics:bool -> unit Fiber.t
 val set_shorten_merlin_diagnostics : t -> shorten_merlin_diagnostics:bool -> unit Fiber.t
 

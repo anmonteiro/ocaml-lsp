@@ -74,7 +74,9 @@ module Events = struct
 
   type t =
     { dune_ready : Signal.t
+    ; dune_progress : Signal.t
     ; multiple_instances : Signal.t
+    ; errors : LogMessageParams.t Mailbox.t
     ; progress : Lsp.Progress.t ProgressParams.t Mailbox.t
     ; mutable diagnostics : PublishDiagnosticsParams.t list
     ; mutable diagnostic_waiter : diagnostic_waiter option
@@ -82,7 +84,9 @@ module Events = struct
 
   let create () =
     { dune_ready = Signal.create ()
+    ; dune_progress = Signal.create ()
     ; multiple_instances = Signal.create ()
+    ; errors = Mailbox.create ()
     ; progress = Mailbox.create ()
     ; diagnostics = []
     ; diagnostic_waiter = None
@@ -90,7 +94,9 @@ module Events = struct
   ;;
 
   let dune_ready t = t.dune_ready
+  let dune_progress t = t.dune_progress
   let multiple_instances t = t.multiple_instances
+  let errors t = t.errors
   let progress t = t.progress
 
   let rec take_matching ~f rev_prefix = function
@@ -137,6 +143,9 @@ module Events = struct
       Signal.notify t.dune_ready
     | LogMessage { message; _ } when String.is_substring message ~substring:" ignores " ->
       Signal.notify t.multiple_instances
+    | LogMessage ({ type_ = Error; _ } as params) -> Mailbox.push t.errors params
+    | LogTrace { message; _ } when String.is_prefix message ~prefix:"Dune build " ->
+      Signal.notify t.dune_progress
     | WorkDoneProgress progress -> Mailbox.push t.progress progress
     | _ -> Fiber.return ()
   ;;
@@ -211,7 +220,30 @@ let stop_process pid =
   ignore (Test.waitpid pid : Unix.process_status)
 ;;
 
-let start_dune ?build_dir root runtime_dir =
+let wait_for_rpc_registration runtime_dir pid =
+  let rpc_dir = Filename.concat runtime_dir "dune/rpc" in
+  let registration = Filename.concat rpc_dir (Printf.sprintf "%d.csexp" pid) in
+  let rec loop retries =
+    let registered =
+      match Fs_io.read_file registration with
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> false
+      | Error _ -> false
+      | Ok contents ->
+        let file : Dune_rpc.Private.Registry.File.t = { path = registration; contents } in
+        Result.is_ok (Dune_rpc.Private.Registry.Dune.of_file file)
+    in
+    if registered
+    then ()
+    else if retries = 0
+    then failwith (Printf.sprintf "Dune %d did not register its RPC endpoint" pid)
+    else (
+      Unix.sleepf 0.01;
+      loop (retries - 1))
+  in
+  loop 500
+;;
+
+let start_dune ?build_dir ?jobs root runtime_dir =
   let prog = Bin.which "dune" |> Option.value_exn in
   let output = Unix.openfile Test.null_device [ Unix.O_WRONLY ] 0o666 in
   let env =
@@ -227,6 +259,9 @@ let start_dune ?build_dir root runtime_dir =
     @ (match build_dir with
        | None -> []
        | Some build_dir -> [ "--build-dir"; build_dir ])
+    @ (match jobs with
+       | None -> []
+       | Some jobs -> [ "-j"; Int.to_string jobs ])
     @ [ "-w"; "@repro" ]
   in
   let pid =
@@ -237,7 +272,9 @@ let start_dune ?build_dir root runtime_dir =
 ;;
 
 let stop_abruptly client pid =
-  let+ () = Client.stop client in
+  let* () = Client.stop client in
+  (* Close the write side before killing the server so pending replies cannot hit EPIPE. *)
+  let+ () = Client.close client in
   terminate_process pid
 ;;
 
@@ -292,15 +329,24 @@ let create_project name =
    (diff expected.ml %%{target}))))
 |jbuild}
        gate);
-  { temp
-  ; root
-  ; runtime_dir
-  ; expected
-  ; trigger
-  ; gate
-  ; old_source
-  ; dune_pid = Some (start_dune root runtime_dir)
-  }
+  let dune_pid = start_dune root runtime_dir in
+  (* These tests exercise connected lifecycle transitions, so make Dune
+     discoverable before starting ocamllsp. *)
+  match wait_for_rpc_registration runtime_dir dune_pid with
+  | () ->
+    { temp
+    ; root
+    ; runtime_dir
+    ; expected
+    ; trigger
+    ; gate
+    ; old_source
+    ; dune_pid = Some dune_pid
+    }
+  | exception exn ->
+    stop_process dune_pid;
+    ignore (Sys.command ("rm -rf -- " ^ Filename.quote temp) : int);
+    raise exn
 ;;
 
 let sanitize_string project string =
@@ -342,12 +388,22 @@ let stop_dune project =
   stop_process pid
 ;;
 
+let restart_dune project =
+  assert (Option.is_none project.dune_pid);
+  let dune_pid = start_dune project.root project.runtime_dir in
+  match wait_for_rpc_registration project.runtime_dir dune_pid with
+  | () -> project.dune_pid <- Some dune_pid
+  | exception exn ->
+    stop_process dune_pid;
+    raise exn
+;;
+
 let destroy_project project =
   Option.iter project.dune_pid ~f:stop_process;
   ignore (Sys.command ("rm -rf -- " ^ Filename.quote project.temp) : int)
 ;;
 
-let run_with_workspace ?capabilities ~root ~runtime_dir events ~f =
+let run_with_workspace ?capabilities ?trace ~root ~runtime_dir events ~f =
   let ocamllsp_stderr = Unix.openfile Test.null_device [ Unix.O_WRONLY ] 0o666 in
   Fun.protect
     ~finally:(fun () -> Unix.close ocamllsp_stderr)
@@ -368,6 +424,7 @@ let run_with_workspace ?capabilities ~root ~runtime_dir events ~f =
          ~stderr:ocamllsp_stderr
          ~capabilities
          ~workspaceFolders:(Some [ workspace ])
+         ?trace
          ~on_spawn:(fun pid -> server_pid := Some pid)
        @@ fun client ->
        Fiber.finalize
@@ -375,7 +432,7 @@ let run_with_workspace ?capabilities ~root ~runtime_dir events ~f =
          ~finally:(fun () -> stop_abruptly client (Option.value_exn !server_pid)))
 ;;
 
-let run ?workspace_root ?capabilities project events ~f =
+let run ?workspace_root ?capabilities ?trace project events ~f =
   let root = Option.value workspace_root ~default:project.root in
-  run_with_workspace ~root ~runtime_dir:project.runtime_dir ?capabilities events ~f
+  run_with_workspace ~root ~runtime_dir:project.runtime_dir ?capabilities ?trace events ~f
 ;;

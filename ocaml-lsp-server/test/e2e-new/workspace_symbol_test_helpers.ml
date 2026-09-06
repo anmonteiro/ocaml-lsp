@@ -84,7 +84,7 @@ let a_bin_main_ml =
   {workspace_symbol|let main_y = Lib.lib_x
 ;;
 
-let () = 
+let () =
   let main_z = "test" in
 
 print_endline (main_z);;
@@ -246,14 +246,18 @@ let print_symbols workspaces symbols =
 
 let workspace_symbol client query =
   Client.request client (WorkspaceSymbol (WorkspaceSymbolParams.create ~query ()))
+  >>| function
+  | None -> None
+  | Some (`SymbolInformation symbols) -> Some symbols
+  | Some (`WorkspaceSymbol _) -> failwith "unexpected resolvable workspace symbols"
 ;;
 
-let run ?on_notification workspaces f =
+let run ?on_notification ?capabilities workspaces f =
   let handler = Client.Handler.make ?on_notification () in
   let workspaceFolders =
     Some (List.map workspaces ~f:(fun workspace -> workspace.folder))
   in
-  Test.run_initialized ~handler ~workspaceFolders (fun client ->
+  Test.run_initialized ~handler ?capabilities ~workspaceFolders (fun client ->
     let* () = f client in
     Test.shutdown_client client)
 ;;

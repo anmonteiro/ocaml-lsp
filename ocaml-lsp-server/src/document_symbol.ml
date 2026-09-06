@@ -12,110 +12,172 @@ let symbol_kind_of_outline_kind = function
   | `Method -> Method
 ;;
 
-let normalize_selection_range ~(range : Range.t) = function
-  | None -> range
-  | Some (selection_range : Range.t) ->
-    let selection_is_valid =
-      Lsp.Position.compare selection_range.start selection_range.end_ <= 0
-    in
-    if selection_is_valid && Lsp.Range.contains range selection_range
-    then selection_range
-    else Option.value (Lsp.Range.intersection range selection_range) ~default:range
+(* An absent [symbolKind.valueSet] means the client only supports the kinds from
+   the initial version of the protocol, so fall back to one of those. *)
+let supported_symbol_kind supported kind =
+  match supported with
+  | None -> kind
+  | Some supported ->
+    if List.mem supported kind ~equal:Poly.equal
+    then kind
+    else (
+      match kind with
+      | SymbolKind.EnumMember -> SymbolKind.Constructor
+      | TypeParameter -> Class
+      | kind -> kind)
 ;;
 
-let rec items_to_symbols ~supports_deprecated_tag items =
+type configured_symbol =
+  { symbol : DocumentSymbol.t
+  ; mode : string
+  ; outline_type : string option
+  ; children : configured_symbol list
+  }
+
+let rec items_to_symbols ~supports_deprecated_tag ~supported_kinds ~mode items =
   List.rev_map
     ~f:
       (fun
         { Query_protocol.outline_name
         ; outline_kind
+        ; outline_type
         ; location
         ; selection
         ; children
         ; deprecated
-        ; _
         } ->
       let range = Range.of_loc location in
       (* The LSP spec requires [selectionRange] to be contained in [range].
          Preserve valid selections, clip non-empty overlaps, and fall back to
          [range] for ghost, invalid, touching, or disjoint selections. *)
       let selectionRange =
-        normalize_selection_range ~range (Range.of_loc_opt selection)
+        match Range.of_loc_opt selection with
+        | None -> range
+        | Some selection -> Lsp.Range.normalize_selection_range range ~selection
       in
       let { Deprecation.deprecated; tags } =
         Deprecation.create
           ~deprecated
-          ~tag:Lsp.Types.SymbolTag.Deprecated
+          ~tag:SymbolTag.Deprecated
           ~supports_tag:supports_deprecated_tag
           ~supports_deprecated_field:true
       in
-      DocumentSymbol.create
-        ~name:outline_name
-        ~kind:(symbol_kind_of_outline_kind outline_kind)
-        ~range
-        ~selectionRange
-        ?deprecated
-        ?tags
-        ~children:(items_to_symbols ~supports_deprecated_tag children)
-        ())
+      let symbol =
+        DocumentSymbol.create
+          ~name:outline_name
+          ~kind:
+            (supported_symbol_kind
+               supported_kinds
+               (symbol_kind_of_outline_kind outline_kind))
+          ~range
+          ~selectionRange
+          ?deprecated
+          ?tags
+          ()
+      in
+      { symbol
+      ; mode
+      ; outline_type
+      ; children =
+          items_to_symbols ~supports_deprecated_tag ~supported_kinds ~mode children
+      })
     items
 ;;
 
-let rec flatten_document_symbols ~uri ~container_name (symbols : DocumentSymbol.t list) =
-  List.concat_map symbols ~f:(fun symbol ->
-    let symbol_information =
-      SymbolInformation.create
-        ?containerName:container_name
-        ~kind:symbol.kind
-        ~location:{ range = symbol.range; uri }
-        ~name:symbol.name
-        ?deprecated:symbol.deprecated
-        ?tags:symbol.tags
-        ()
-    in
-    let children =
-      flatten_document_symbols
-        ~uri
-        ~container_name:(Some symbol.name)
-        (Option.value symbol.children ~default:[])
-    in
-    symbol_information :: children)
+let merge_type_details details =
+  match details with
+  | [] | [ _ ] -> None
+  | (_, first) :: rest
+    when List.for_all rest ~f:(fun (_, detail) -> Poly.equal detail first) -> None
+  | details ->
+    List.map details ~f:(fun (mode, detail) ->
+      sprintf "%s: %s" mode (Option.value detail ~default:"<none>"))
+    |> String.concat ~sep:"\n"
+    |> Option.some
+;;
+
+let rec merge_document_symbols symbol_lists =
+  let rec add
+            (({ symbol; mode; outline_type; children } : configured_symbol) as configured)
+    = function
+    | [] -> [ symbol, [ mode, outline_type ], [ children ] ]
+    | (candidate, details, child_lists) :: rest ->
+      if Poly.equal candidate symbol
+      then (candidate, (mode, outline_type) :: details, children :: child_lists) :: rest
+      else (candidate, details, child_lists) :: add configured rest
+  in
+  List.concat symbol_lists
+  |> List.fold_left ~init:[] ~f:(fun groups symbol -> add symbol groups)
+  |> List.map ~f:(fun ((symbol : DocumentSymbol.t), details, child_lists) ->
+    { symbol with
+      detail = merge_type_details (List.rev details)
+    ; children = Some (merge_document_symbols (List.rev child_lists))
+    })
 ;;
 
 let run (client_capabilities : ClientCapabilities.t) doc uri =
   match Document.kind doc with
   | `Other -> Fiber.return None
   | `Merlin merlin ->
-    let+ outline =
-      Document.Merlin.with_pipeline_exn ~name:"document-symbols" merlin (fun pipeline ->
-        Query_commands.dispatch pipeline Query_protocol.Outline)
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
     in
-    let document_symbol_capabilities =
-      let open Option.O in
-      let* text_document = client_capabilities.textDocument in
-      text_document.documentSymbol
+    let+ configured =
+      Document.Merlin.dispatch_all
+        ~name:"document-symbols"
+        merlin
+        ~configurations
+        Query_protocol.Outline
     in
     let supports_deprecated_tag =
-      Option.value
+      Option.value_map
+        (Capabilities.document_symbol_tag_support client_capabilities)
         ~default:false
-        (let open Option.O in
-         let* document_symbol = document_symbol_capabilities in
-         let* tag_support = document_symbol.tagSupport in
-         Some
-           (Deprecation.tag_supported
-              tag_support.valueSet
-              ~tag:Lsp.Types.SymbolTag.Deprecated))
+        ~f:(fun value_set ->
+          Deprecation.tag_supported
+            value_set
+            ~tag:Deprecated
+            ~equal:(fun SymbolTag.Deprecated Deprecated -> true))
     in
-    let symbols = items_to_symbols ~supports_deprecated_tag outline in
-    (match
-       Option.value
-         ~default:false
-         (let open Option.O in
-          let* document_symbol = document_symbol_capabilities in
-          document_symbol.hierarchicalDocumentSymbolSupport)
-     with
+    let supported_kinds = Capabilities.document_symbol_kind_support client_capabilities in
+    let symbols, failures, successes =
+      Merlin_dot_protocol.Nonempty_list.to_list configured
+      |> List.fold_left
+           ~init:([], [], 0)
+           ~f:
+             (fun
+               (symbols, failures, successes)
+               ({ configuration; result } : _ Document.Merlin.configured_result)
+             ->
+             match result with
+             | Error error -> symbols, (configuration, error) :: failures, successes
+             | Ok outline ->
+               let mode = Merlin_config.configuration_label configuration in
+               ( items_to_symbols ~supports_deprecated_tag ~supported_kinds ~mode outline
+                 :: symbols
+               , failures
+               , successes + 1 ))
+    in
+    List.iter failures ~f:(fun (configuration, error) ->
+      Log.log ~section:"merlin" (fun () ->
+        Log.msg
+          "Merlin document symbols configuration failed"
+          [ "mode", `String (Merlin_config.configuration_label configuration)
+          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+          ]));
+    if successes = 0
+    then (
+      let primary = Merlin_config.primary configurations in
+      let _, error =
+        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
+        |> Option.value ~default:(List.hd_exn failures)
+      in
+      Exn_with_backtrace.reraise error);
+    let symbols = merge_document_symbols (List.rev symbols) in
+    (match Capabilities.document_symbol_hierarchical_support client_capabilities with
      | true -> Some (`DocumentSymbol symbols)
      | false ->
-       let flattened = flatten_document_symbols ~uri ~container_name:None symbols in
+       let uri = Source_path.uri uri in
+       let flattened = Lsp.Document_symbol.flatten ~uri symbols in
        Some (`SymbolInformation flattened))
 ;;

@@ -124,6 +124,22 @@ let hover_at_cursor parsetree (`Logical (cursor_line, cursor_col)) =
   let typ (_ : Ast_iterator.iterator) (typ : Parsetree.core_type) =
     if is_at_cursor typ.ptyp_loc then result := Some `Type_enclosing
   in
+  (* Hover a variant constructor where it is declared *)
+  let constructor_declaration
+        (self : Ast_iterator.iterator)
+        (decl : Parsetree.constructor_declaration)
+    =
+    if is_at_cursor decl.pcd_name.loc then result := Some `Type_enclosing;
+    Ast_iterator.default_iterator.constructor_declaration self decl
+  in
+  (* Hover an exception, or a type extension constructor, where it is declared *)
+  let extension_constructor
+        (self : Ast_iterator.iterator)
+        (ext : Parsetree.extension_constructor)
+    =
+    if is_at_cursor ext.pext_name.loc then result := Some `Type_enclosing;
+    Ast_iterator.default_iterator.extension_constructor self ext
+  in
   (* Hover a type declaration *)
   let type_declaration (self : Ast_iterator.iterator) (decl : Parsetree.type_declaration) =
     if is_at_cursor decl.ptype_name.loc
@@ -244,6 +260,8 @@ let hover_at_cursor parsetree (`Logical (cursor_line, cursor_col)) =
     ; expr
     ; typ
     ; type_declaration
+    ; constructor_declaration
+    ; extension_constructor
     ; value_description
     ; module_expr
     ; module_type
@@ -314,16 +332,7 @@ let format_ppx_expansion ~ppx ~expansion =
   `MarkedString { Lsp.Types.MarkedString.value; language = Some "ocaml" }
 ;;
 
-let type_enclosing_hover
-      ~(server : State.t Server.t)
-      ~(doc : Document.t)
-      ~with_syntax_doc
-      ~merlin
-      ~mode
-      ~uri
-      ~position
-  =
-  let state = Server.state server in
+let hover_verbosity (state : State.t) ~uri ~position ~version mode =
   let verbosity =
     let mode =
       match mode, environment_mode with
@@ -339,25 +348,63 @@ let type_enclosing_hover
       let v =
         match state.hover_extended.history with
         | None -> 0
-        | Some (h_uri, h_position, h_verbosity) ->
-          if Uri.equal uri h_uri && Lsp.Position.compare position h_position = 0
-          then succ h_verbosity
+        | Some history ->
+          if
+            Uri.equal uri history.uri
+            && version = history.version
+            && Lsp.Position.compare position history.position = 0
+          then succ history.verbosity
           else 0
       in
-      state.hover_extended.history <- Some (uri, position, v);
+      state.hover_extended.history <- Some { uri; position; version; verbosity = v };
       v
   in
-  let* type_enclosing =
-    Document.Merlin.type_enclosing
-      ~name:"hover-enclosing"
-      merlin
-      (Position.logical position)
-      verbosity
-      ~with_syntax_doc
+  verbosity
+;;
+
+let doc_comment pipeline pos =
+  match Query_commands.dispatch pipeline (Query_protocol.Document (None, pos)) with
+  | `Found text | `Builtin text -> Some text
+  | _ -> None
+;;
+
+type raw_hover =
+  | Type_enclosing of Document.Merlin.type_enclosing
+  | Ppx of
+      { name : string
+      ; code : string
+      ; range : Range.t
+      }
+
+let type_enclosing pipeline merlin position verbosity ~with_syntax_doc =
+  let command = Query_protocol.Type_enclosing (None, position, Some 0) in
+  let pipeline =
+    match verbosity with
+    | 0 -> pipeline
+    | verbosity ->
+      let source = Document.Merlin.source merlin in
+      let config = Mpipeline.final_config pipeline in
+      let config =
+        { config with query = { config.query with verbosity = Lvl verbosity } }
+      in
+      Mpipeline.make config source
   in
-  match type_enclosing with
-  | None -> Fiber.return None
-  | Some { Document.Merlin.loc; typ; doc = documentation; syntax_doc } ->
+  match Query_commands.dispatch pipeline command with
+  | [] | (_, `Index _, _) :: _ -> None
+  | (loc, `String typ, _) :: _ ->
+    let doc = doc_comment pipeline position in
+    let syntax_doc =
+      if with_syntax_doc then Document.Merlin.syntax_doc pipeline position else None
+    in
+    Some (Type_enclosing { loc; typ; doc; syntax_doc })
+;;
+
+let format_raw_hover ~(server : State.t Server.t) ~(doc : Document.t) ~markdown = function
+  | Ppx { name; code; range } ->
+    let contents = format_ppx_expansion ~ppx:name ~expansion:code in
+    Fiber.return (Hover.create ~contents ~range ())
+  | Type_enclosing { Document.Merlin.loc; typ; doc = documentation; syntax_doc } ->
+    let state = Server.state server in
     let syntax = Document.syntax doc in
     let* typ =
       (* We ask Ocamlformat to format this type *)
@@ -383,57 +430,169 @@ let type_enclosing_hover
         typ
     in
     let contents =
-      let markdown =
-        let client_capabilities = State.client_capabilities state in
-        ClientCapabilities.markdown_support client_capabilities ~field:(fun td ->
-          Option.map td.hover ~f:(fun h -> h.contentFormat))
-      in
       format_type_enclosing ~syntax ~markdown ~typ ~doc:documentation ~syntax_doc
     in
     let range = Range.of_loc loc in
-    let hover = Hover.create ~contents ~range () in
-    Fiber.return (Some hover)
+    Fiber.return (Hover.create ~contents ~range ())
 ;;
 
-let handle server { HoverParams.textDocument = { uri }; position; _ } mode =
+let hover_contents ~markdown (hover : Hover.t) =
+  match hover.contents with
+  | `MarkupContent { MarkupContent.kind = Markdown; value } -> value
+  | `MarkupContent { MarkupContent.kind = PlainText; value } ->
+    if markdown then format_as_code_block ~highlighter:"" [ value ] else value
+  | `MarkedString { Lsp.Types.MarkedString.language; value } ->
+    if markdown
+    then
+      Option.value_map language ~default:value ~f:(fun highlighter ->
+        format_as_code_block ~highlighter [ value ])
+    else value
+  | `List values ->
+    List.map values ~f:(fun { Lsp.Types.MarkedString.language; value } ->
+      if markdown
+      then
+        Option.value_map language ~default:value ~f:(fun highlighter ->
+          format_as_code_block ~highlighter [ value ])
+      else value)
+    |> print_dividers
+;;
+
+let aggregate_hovers
+      ~markdown
+      ~configuration_count
+      (hovers : (Merlin_config.configuration * Hover.t) list)
+  =
+  match hovers with
+  | [] -> None
+  | [ (_, hover) ] when configuration_count = 1 -> Some hover
+  | (_, first) :: rest
+    when List.length hovers = configuration_count
+         && List.for_all rest ~f:(fun (_, hover) -> Poly.equal hover first) -> Some first
+  | (first_configuration, first) :: rest ->
+    let hovers = (first_configuration, first) :: rest in
+    let range =
+      if List.for_all rest ~f:(fun (_, hover) -> Poly.equal hover.range first.range)
+      then first.range
+      else None
+    in
+    let value =
+      List.map hovers ~f:(fun (configuration, hover) ->
+        let label = Merlin_config.configuration_label configuration in
+        let contents = hover_contents ~markdown hover in
+        if markdown
+        then sprintf "### %s\n\n%s" label contents
+        else sprintf "%s:\n%s" label contents)
+      |> String.concat ~sep:(if markdown then "\n\n---\n\n" else "\n\n")
+    in
+    let kind = if markdown then MarkupKind.Markdown else MarkupKind.PlainText in
+    Some (Hover.create ~contents:(`MarkupContent { MarkupContent.kind; value }) ?range ())
+;;
+
+let log_failure configuration error =
+  Log.log ~section:"merlin" (fun () ->
+    Log.msg
+      "Merlin configuration failed while computing hover"
+      [ "mode", `String (Merlin_config.configuration_label configuration)
+      ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+      ])
+;;
+
+let handle_document server doc ~uri ~position mode =
   Fiber.of_thunk (fun () ->
     let state : State.t = Server.state server in
-    let doc =
-      let store = state.store in
-      Document_store.get store uri
-    in
     match Document.kind doc with
     | `Other -> Fiber.return None
     | `Merlin merlin ->
-      let* parsetree =
-        Document.Merlin.with_pipeline_exn
-          ~name:"hover"
-          (Document.merlin_exn doc)
-          (fun pipeline -> Mpipeline.reader_parsetree pipeline)
+      let* { Document.Merlin.configurations; _ } =
+        Document.Merlin.configuration_context_exn merlin
       in
-      (match hover_at_cursor parsetree (Position.logical position) with
-       | None -> Fiber.return None
-       | Some `Type_enclosing ->
-         let with_syntax_doc =
-           match state.configuration.data.syntax_documentation with
-           | Some { enable = true } -> true
-           | Some _ | None -> false
-         in
-         type_enclosing_hover ~server ~doc ~merlin ~mode ~uri ~position ~with_syntax_doc
-       | Some (`Ppx ppx) ->
-         let+ ppxed_source =
-           Document.Merlin.dispatch_exn
-             ~name:"expand-ppx"
-             (Document.merlin_exn doc)
-             (Query_protocol.Expand_ppx (Position.logical position))
-         in
-         (match ppxed_source with
-          | `Found { Query_protocol.code; attr_start; attr_end } ->
-            let range =
-              Range.of_loc
-                { loc_start = attr_start; loc_end = attr_end; loc_ghost = false }
-            in
-            let contents = format_ppx_expansion ~ppx ~expansion:code in
-            Some (Hover.create ~contents ~range ())
-          | `No_ppx -> None)))
+      let configuration_count =
+        Merlin_config.configuration_list configurations |> List.length
+      in
+      let markdown =
+        Capabilities.supports_markdown
+          (Capabilities.hover_content_format (State.client_capabilities state))
+      in
+      let verbosity =
+        hover_verbosity state ~uri ~position ~version:(Document.version doc) mode
+      in
+      let with_syntax_doc =
+        match state.configuration.data.syntax_documentation with
+        | Some { enable = true } -> true
+        | Some _ | None -> false
+      in
+      let logical_position = Position.logical position in
+      let* results =
+        Document.Merlin.with_configurations
+          ~name:"hover"
+          merlin
+          ~configurations
+          (fun _ pipeline ->
+             let parsetree = Mpipeline.reader_parsetree pipeline in
+             match hover_at_cursor parsetree logical_position with
+             | None -> None
+             | Some `Type_enclosing ->
+               type_enclosing pipeline merlin logical_position verbosity ~with_syntax_doc
+             | Some (`Ppx name) ->
+               (match
+                  Query_commands.dispatch
+                    pipeline
+                    (Query_protocol.Expand_ppx logical_position)
+                with
+                | `No_ppx -> None
+                | `Found { Query_protocol.code; attr_start; attr_end } ->
+                  let range =
+                    Range.of_loc
+                      { loc_start = attr_start; loc_end = attr_end; loc_ghost = false }
+                  in
+                  Some (Ppx { name; code; range })))
+      in
+      let results = Merlin_dot_protocol.Nonempty_list.to_list results in
+      let rec format acc = function
+        | [] -> Fiber.return (List.rev acc)
+        | ({ configuration; result } : _ Document.Merlin.configured_result) :: rest ->
+          (match result with
+           | Error error ->
+             log_failure configuration error;
+             format acc rest
+           | Ok None -> format acc rest
+           | Ok (Some raw_hover) ->
+             let* hover = format_raw_hover ~server ~doc ~markdown raw_hover in
+             format ((configuration, hover) :: acc) rest)
+      in
+      let* hovers = format [] results in
+      (match hovers with
+       | _ :: _ -> Fiber.return (aggregate_hovers ~markdown ~configuration_count hovers)
+       | [] ->
+         (match
+            List.find_map results ~f:(fun { Document.Merlin.result; _ } ->
+              match result with
+              | Ok _ -> None
+              | Error error -> Some error)
+          with
+          | Some error
+            when List.for_all results ~f:(fun { Document.Merlin.result; _ } ->
+                   Result.is_error result) -> Exn_with_backtrace.reraise error
+          | Some _ | None -> Fiber.return None)))
+;;
+
+let handle server { HoverParams.textDocument = { uri }; position; _ } mode =
+  let state : State.t = Server.state server in
+  let doc = Document_store.get state.store uri in
+  handle_document server doc ~uri ~position mode
+;;
+
+let handle_primary server { HoverParams.textDocument = { uri }; position; _ } mode =
+  let state : State.t = Server.state server in
+  let doc = Document_store.get state.store uri in
+  match Document.kind doc with
+  | `Other -> Fiber.return None
+  | `Merlin merlin ->
+    let* { Document.Merlin.configurations; _ } =
+      Document.Merlin.configuration_context_exn merlin
+    in
+    let doc =
+      Document.with_merlin_configuration doc (Merlin_config.primary configurations)
+    in
+    handle_document server doc ~uri ~position mode
 ;;

@@ -71,6 +71,7 @@ possible and does not make any assumptions about IO.
   (ppx_expect (and (>= v0.17.0) :with-test))
   (ppx_sexp_conv (and (>= v0.17.0) :with-test))
   (ocamlformat (and :with-test (= 0.29.0)))
+  (ocp-indent :with-test)
   (ocamlc-loc (>= 3.7.0))
   (pp (>= 1.1.2))
   (csexp (>= 1.5))
@@ -79,6 +80,17 @@ possible and does not make any assumptions about IO.
   (merlin-lib (and (>= 5.8) (< 5.9)))
   (ocaml-index :post)
   (ppx_yojson_conv :with-dev-setup)))
+
+(package
+ (name ocp-indent-rpc)
+ (synopsis "Persistent RPC server for ocp-indent")
+ (description
+  "A small RPC server that exposes ocp-indent as a persistent process for editor integrations.")
+ (depends
+  (csexp (>= 1.5))
+  (ocaml (>= 4.14))
+  (ocp-indent (>= 1.6.1))
+  (ppx_expect :with-test)))
 
 (package
  (name jsonrpc)

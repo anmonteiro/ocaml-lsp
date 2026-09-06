@@ -1,8 +1,13 @@
 module Progress = Progress
 module Position = Position
 module Range = Range
+module Document_symbol = Document_symbol
 module Client_notification = Client_notification
 module Client_request = Client_request
+module Code_action = Code_action
+module Deprecation = Deprecation
+module Capabilities = Capabilities
+module Experimental = Experimental
 module Extension = Extension
 module Header = Header
 module Import = Import
@@ -15,6 +20,7 @@ module Uri = Uri0
 module Io = Io
 module Cli = Cli
 module Diff = Diff
+module Workspaces = Workspaces
 
 module Private = struct
   module Array_view = Array_view

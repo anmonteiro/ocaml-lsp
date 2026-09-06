@@ -17,7 +17,9 @@ module Events : sig
   type t
 
   val dune_ready : t -> Signal.t
+  val dune_progress : t -> Signal.t
   val multiple_instances : t -> Signal.t
+  val errors : t -> LogMessageParams.t Mailbox.t
   val progress : t -> Lsp.Progress.t ProgressParams.t Mailbox.t
 
   val wait_for_diagnostics
@@ -57,16 +59,22 @@ type project = private
   ; mutable dune_pid : int option
   }
 
-val start_dune : ?build_dir:string -> string -> string -> int
+val start_dune : ?build_dir:string -> ?jobs:int -> string -> string -> int
+
+(** Wait until [pid] appears in the Dune RPC registry under [runtime_dir]. *)
+val wait_for_rpc_registration : string -> int -> unit
+
 val stop_process : int -> unit
 val create_project : string -> project
 val stop_dune : project -> unit
+val restart_dune : project -> unit
 val destroy_project : project -> unit
 val print_payload : project -> string -> Yojson.Safe.t -> unit
 val print_payloads : project -> string -> ('a -> Yojson.Safe.t) -> 'a list -> unit
 
 val run_with_workspace
   :  ?capabilities:ClientCapabilities.t
+  -> ?trace:TraceValue.t
   -> root:string
   -> runtime_dir:string
   -> Lifecycle_events.t
@@ -76,6 +84,7 @@ val run_with_workspace
 val run
   :  ?workspace_root:string
   -> ?capabilities:ClientCapabilities.t
+  -> ?trace:TraceValue.t
   -> project
   -> Lifecycle_events.t
   -> f:(unit Client.t -> WorkspaceFolder.t -> 'a Fiber.t)

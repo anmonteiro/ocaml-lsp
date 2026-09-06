@@ -65,45 +65,37 @@ let%expect_test "definition-like result wire shapes" =
   [%expect
     {|
     definition:
-    [
-      {
-        "range": {
-          "end": { "character": 4, "line": 2 },
-          "start": { "character": 4, "line": 2 }
-        },
-        "uri": "file:///workspace/test.ml"
-      }
-    ]
+    {
+      "range": {
+        "end": { "character": 4, "line": 2 },
+        "start": { "character": 4, "line": 2 }
+      },
+      "uri": "file:///workspace/test.ml"
+    }
     declaration:
-    [
-      {
-        "range": {
-          "end": { "character": 4, "line": 2 },
-          "start": { "character": 4, "line": 2 }
-        },
-        "uri": "file:///workspace/test.ml"
-      }
-    ]
+    {
+      "range": {
+        "end": { "character": 4, "line": 2 },
+        "start": { "character": 4, "line": 2 }
+      },
+      "uri": "file:///workspace/test.ml"
+    }
     type definition:
-    [
-      {
-        "range": {
-          "end": { "character": 4, "line": 2 },
-          "start": { "character": 4, "line": 2 }
-        },
-        "uri": "file:///workspace/test.ml"
-      }
-    ]
+    {
+      "range": {
+        "end": { "character": 4, "line": 2 },
+        "start": { "character": 4, "line": 2 }
+      },
+      "uri": "file:///workspace/test.ml"
+    }
     implementation:
-    [
-      {
-        "range": {
-          "end": { "character": 4, "line": 2 },
-          "start": { "character": 4, "line": 2 }
-        },
-        "uri": "file:///workspace/test.ml"
-      }
-    ]
+    {
+      "range": {
+        "end": { "character": 4, "line": 2 },
+        "start": { "character": 4, "line": 2 }
+      },
+      "uri": "file:///workspace/test.ml"
+    }
     |}]
 ;;
 
@@ -153,9 +145,81 @@ let%expect_test "workspace symbol and nullable results" =
     `Null;
   [%expect
     {|
-    workspace symbol: rejected
-    signature help null: rejected
-    selection range null: rejected
-    rename null: rejected
+    workspace symbol: accepted
+    signature help null: accepted
+    selection range null: accepted
+    rename null: accepted
     |}]
+;;
+
+let%expect_test "code lens result is nullable" =
+  check_response
+    "code lens null"
+    (Client_request.E
+       (Client_request.TextDocumentCodeLens
+          (CodeLensParams.create ~textDocument:protocol_document ())))
+    `Null;
+  [%expect {| code lens null: accepted |}]
+;;
+
+let%expect_test "workspace folders result is nullable" =
+  check_decode
+    "workspace folders null"
+    (Server_request.response_of_json Server_request.WorkspaceFolders)
+    `Null;
+  [%expect {| workspace folders null: accepted |}]
+;;
+
+let%expect_test "workspace symbol result preserves resolvable fields" =
+  let workspace_symbol =
+    `List
+      [ `Assoc
+          [ "data", `String "symbol-id"
+          ; "kind", `Int 12
+          ; "location", `Assoc [ "uri", DocumentUri.yojson_of_t protocol_uri ]
+          ; "name", `String "value"
+          ]
+      ]
+  in
+  round_trip_response
+    "workspace symbol"
+    (Client_request.E
+       (Client_request.WorkspaceSymbol (WorkspaceSymbolParams.create ~query:"value" ())))
+    workspace_symbol;
+  [%expect
+    {|
+    workspace symbol:
+    [
+      {
+        "data": "symbol-id",
+        "kind": 12,
+        "location": { "uri": "file:///workspace/test.ml" },
+        "name": "value"
+      }
+    ]
+    |}]
+;;
+
+let%expect_test "workspace symbol decoding inspects every result" =
+  let workspace_symbols =
+    `List
+      [ `Assoc
+          [ "kind", `Int 12
+          ; "location", Location.yojson_of_t protocol_location
+          ; "name", `String "resolved"
+          ]
+      ; `Assoc
+          [ "data", `String "symbol-id"
+          ; "kind", `Int 12
+          ; "location", `Assoc [ "uri", DocumentUri.yojson_of_t protocol_uri ]
+          ; "name", `String "unresolved"
+          ]
+      ]
+  in
+  check_response
+    "workspace symbols"
+    (Client_request.E
+       (Client_request.WorkspaceSymbol (WorkspaceSymbolParams.create ~query:"value" ())))
+    workspace_symbols;
+  [%expect {| workspace symbols: accepted |}]
 ;;

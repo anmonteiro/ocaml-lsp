@@ -2,6 +2,28 @@ open Test.Import
 open Lsp_helpers
 open Code_actions
 
+let interface_path = "foo.mli"
+
+let prepare_implementation source client =
+  let uri = DocumentUri.of_path "foo.ml" in
+  Test.open_document ~client ~uri ~source ()
+;;
+
+let apply_interface_action ~implementation ~title interface =
+  code_action_test
+    ~prep:(prepare_implementation implementation)
+    ~path:interface_path
+    ~print_none:true
+    ~title
+    interface
+;;
+
+let insert_inferred_interface = apply_interface_action ~title:"Insert inferred interface"
+
+let update_signatures =
+  apply_interface_action ~title:"Update signature(s) to match implementation"
+;;
+
 let%expect_test "can infer module interfaces" =
   let impl_source =
     {ocaml|
@@ -9,40 +31,13 @@ type t = Foo of int | Bar of bool
 let f (x : t) = x
 |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source = "" in
-  let range = range ~start_line:0 ~start_character:0 ~end_line:0 ~end_character:0 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "inferred_intf");
+  insert_inferred_interface ~implementation:impl_source {ocaml|$|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "type t = Foo of int | Bar of bool\n\nval f : t -> t\n",
-                "range": {
-                  "end": { "character": 0, "line": 0 },
-                  "start": { "character": 0, "line": 0 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "inferred_intf",
-      "title": "Insert inferred interface"
-    } |}]
+    type t = Foo of int | Bar of bool
+
+    val f : t -> t
+    |}]
 ;;
 
 let%expect_test "inferred interface excludes existing names" =
@@ -52,10 +47,29 @@ type t = Foo of int | Bar of bool
 let f (x : t) = x
 |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
+  insert_inferred_interface
+    ~implementation:impl_source
+    {ocaml|$
+val f : t -> t
+|ocaml};
+  [%expect
+    {|
+    type t = Foo of int | Bar of bool
+
+    val f : t -> t
+    |}]
+;;
+
+let%expect_test "no inferred interface when the interface is complete" =
+  let impl_source =
+    {ocaml|
+type t = Foo of int | Bar of bool
+let f (x : t) = x
+|ocaml}
+  in
   let intf_source =
     {ocaml|
+type t = Foo of int | Bar of bool
 val f : t -> t
 |ocaml}
   in
@@ -63,34 +77,10 @@ val f : t -> t
   print_code_actions
     intf_source
     range
-    ~prep
-    ~path:"foo.mli"
+    ~prep:(prepare_implementation impl_source)
+    ~path:interface_path
     ~filter:(find_action "inferred_intf");
-  [%expect
-    {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "type t = Foo of int | Bar of bool\n",
-                "range": {
-                  "end": { "character": 0, "line": 0 },
-                  "start": { "character": 0, "line": 0 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "inferred_intf",
-      "title": "Insert inferred interface"
-    }
-    |}]
+  [%expect {| No code actions |}]
 ;;
 
 let%expect_test "update-signatures adds new function args" =
@@ -103,45 +93,16 @@ let f (x : t) (d : bool) =
   |Foo _ -> d
 |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source =
+  update_signatures
+    ~implementation:impl_source
     {ocaml|
 type t = Foo of int | Bar of bool
-val f : t -> bool
-|ocaml}
-  in
-  let range = range ~start_line:2 ~start_character:0 ~end_line:2 ~end_character:0 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "update_intf");
+$val f : t -> bool
+|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "val f : t -> bool -> bool\n",
-                "range": {
-                  "end": { "character": 17, "line": 2 },
-                  "start": { "character": 0, "line": 2 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "update_intf",
-      "title": "Update signature(s) to match implementation"
-    }
+    type t = Foo of int | Bar of bool
+    val f : t -> bool -> bool
     |}]
 ;;
 
@@ -152,45 +113,12 @@ let f i s b =
   if b then String.length s > i else String.length s < i
 |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source =
+  update_signatures
+    ~implementation:impl_source
     {ocaml|
-val f : int -> string -> 'a list -> bool -> bool
-|ocaml}
-  in
-  let range = range ~start_line:1 ~start_character:10 ~end_line:1 ~end_character:10 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "update_intf");
-  [%expect
-    {|
-  Code actions:
-  {
-    "edit": {
-      "documentChanges": [
-        {
-          "edits": [
-            {
-              "newText": "val f : int -> string -> bool -> bool\n",
-              "range": {
-                "end": { "character": 48, "line": 1 },
-                "start": { "character": 0, "line": 1 }
-              }
-            }
-          ],
-          "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-        }
-      ]
-    },
-    "isPreferred": false,
-    "kind": "update_intf",
-    "title": "Update signature(s) to match implementation"
-  }
-  |}]
+val f : in$t -> string -> 'a list -> bool -> bool
+|ocaml};
+  [%expect {| val f : int -> string -> bool -> bool |}]
 ;;
 
 let%expect_test "update-signatures updates parameter types" =
@@ -200,45 +128,12 @@ let f i s l b =
   if b then List.length s > i else List.length l < i
   |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source =
+  update_signatures
+    ~implementation:impl_source
     {ocaml|
-val f : int -> string -> 'a list -> bool -> bool
-|ocaml}
-  in
-  let range = range ~start_line:1 ~start_character:1 ~end_line:1 ~end_character:12 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "update_intf");
-  [%expect
-    {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "val f : int -> 'a list -> 'b list -> bool -> bool\n",
-                "range": {
-                  "end": { "character": 48, "line": 1 },
-                  "start": { "character": 0, "line": 1 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "update_intf",
-      "title": "Update signature(s) to match implementation"
-    }
-    |}]
+v$al f : int $-> string -> 'a list -> bool -> bool
+|ocaml};
+  [%expect {| val f : int -> 'a list -> 'b list -> bool -> bool |}]
 ;;
 
 let%expect_test "update-signatures preserves functions and their comments" =
@@ -251,11 +146,10 @@ let g x y z ~another_arg ~yet_another_arg ~keep_them_coming = x - y + z + anothe
 let h x = x *. 2.0;;
   |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source =
+  update_signatures
+    ~implementation:impl_source
     {ocaml|
-val f :
+$val f :
     int  (* This comment should stay. *)
     -> int
 
@@ -264,47 +158,23 @@ val g : int
     -> int
 
 (* This comment should stay even though the function changes. *)
-val h : int -> bool
-|ocaml}
-  in
-  let range = range ~start_line:1 ~start_character:0 ~end_line:10 ~end_character:19 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "update_intf");
+val h : int -> bool$
+|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "val g :\n  int ->\n  int ->\n  int ->\n  another_arg:int -> yet_another_arg:int -> keep_them_coming:int -> int\n",
-                "range": {
-                  "end": { "character": 10, "line": 7 },
-                  "start": { "character": 0, "line": 5 }
-                }
-              },
-              {
-                "newText": "val h : float -> float\n",
-                "range": {
-                  "end": { "character": 19, "line": 10 },
-                  "start": { "character": 0, "line": 10 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "update_intf",
-      "title": "Update signature(s) to match implementation"
-    }
+    val f :
+        int  (* This comment should stay. *)
+        -> int
+
+    val g :
+      int ->
+      int ->
+      int ->
+      another_arg:int -> yet_another_arg:int -> keep_them_coming:int -> int
+
+
+    (* This comment should stay even though the function changes. *)
+    val h : float -> float
     |}]
 ;;
 
@@ -324,44 +194,18 @@ module M = struct
 end
 |ocaml}
   in
-  let uri = DocumentUri.of_path "foo.ml" in
-  let prep client = Test.open_document ~client ~uri ~source:impl_source () in
-  let intf_source =
+  update_signatures
+    ~implementation:impl_source
     {ocaml|
-module M : sig type t = I of int | B of bool end
-|ocaml}
-  in
-  let range = range ~start_line:1 ~start_character:0 ~end_line:1 ~end_character:0 in
-  print_code_actions
-    intf_source
-    range
-    ~prep
-    ~path:"foo.mli"
-    ~filter:(find_action "update_intf");
+$module M : sig type t = I of int | B of bool end
+|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "module M :\n  sig\n    type t = I of int | F of float\n    val f : t -> long_name_for_an_integer_argument:int -> int\n  end\n",
-                "range": {
-                  "end": { "character": 48, "line": 1 },
-                  "start": { "character": 0, "line": 1 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.mli", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "update_intf",
-      "title": "Update signature(s) to match implementation"
-    }
+    module M :
+      sig
+        type t = I of int | F of float
+        val f : t -> long_name_for_an_integer_argument:int -> int
+      end
     |}]
 ;;
 
@@ -661,81 +505,43 @@ let%expect_test "shouldn't find the jump target on the same line" =
 ;;
 
 let%expect_test "can combine cases with multiple RHSes" =
-  let source =
+  code_action_test
+    ~print_none:true
+    ~title:"Combine-cases"
     {ocaml|
     match card with
     | Ace -> _
-    | King -> _
+   $ | King -> _
     | Queen -> "Face card!"
     | Jack -> "Face card?"
-    | Number _ -> _
-|ocaml}
-  in
-  let range = range ~start_line:3 ~start_character:3 ~end_line:6 ~end_character:6 in
-  print_code_actions source range ~filter:(find_action "combine-cases");
+    | $Number _ -> _
+|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "    | King | Queen | Jack | Number _ -> _\n",
-                "range": {
-                  "end": { "character": 0, "line": 7 },
-                  "start": { "character": 0, "line": 3 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.ml", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "combine-cases",
-      "title": "Combine-cases"
-    }
+    match card with
+    | Ace -> _
+    | King | Queen | Jack | Number _ -> _
     |}]
 ;;
 
 let%expect_test "can combine cases with one unique RHS" =
-  let source =
+  code_action_test
+    ~print_none:true
+    ~title:"Combine-cases"
     {ocaml|
     match card with
     | Ace -> _
-    | King -> _
-    | Queen -> "Face card!"
+   $ | King -> _
+    $| Queen -> "Face card!"
     | Jack -> "Face card?"
     | Number _ -> _
-|ocaml}
-  in
-  let range = range ~start_line:3 ~start_character:3 ~end_line:4 ~end_character:4 in
-  print_code_actions source range ~filter:(find_action "combine-cases");
+|ocaml};
   [%expect
     {|
-    Code actions:
-    {
-      "edit": {
-        "documentChanges": [
-          {
-            "edits": [
-              {
-                "newText": "    | King | Queen -> \"Face card!\"\n",
-                "range": {
-                  "end": { "character": 0, "line": 5 },
-                  "start": { "character": 0, "line": 3 }
-                }
-              }
-            ],
-            "textDocument": { "uri": "file:///foo.ml", "version": 0 }
-          }
-        ]
-      },
-      "isPreferred": false,
-      "kind": "combine-cases",
-      "title": "Combine-cases"
-    }
+    match card with
+    | Ace -> _
+    | King | Queen -> "Face card!"
+    | Jack -> "Face card?"
+    | Number _ -> _
     |}]
 ;;

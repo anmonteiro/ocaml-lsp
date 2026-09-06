@@ -257,7 +257,7 @@ let%expect_test "documentOutline with a module" =
     {|
     module T = struct
       type t = int
-    end              
+    end
   |}
   in
   let request client =
@@ -824,8 +824,8 @@ let%expect_test "normalizes document-symbol selection ranges from Merlin" =
            Printf.printf
              "%s: range=%s selection=%s\n"
              label
-             (Lsp.Range.to_string symbol.range)
-             (Lsp.Range.to_string symbol.selectionRange))
+             (Range.to_string symbol.range)
+             (Range.to_string symbol.selectionRange))
       | Some (`SymbolInformation _) | None ->
         Printf.printf "%s: unexpected response\n" label
     in
@@ -926,5 +926,108 @@ let
     disjoint after: range=((0, 0), (0, 3)) selection=((0, 0), (0, 3))
     ghost: range=((1, 24), (1, 25)) selection=((1, 24), (1, 25))
     ghost overlapping first line: range=((0, 41), (2, 1)) selection=((0, 41), (2, 1))
+    |}]
+;;
+
+let%expect_test "symbol kinds are restricted to those the client supports" =
+  let source = "type t = A | B\nexception E\n" in
+  let capabilities =
+    let symbolKind =
+      (* The kinds from the initial version of the protocol, File to Array. *)
+      ClientSymbolKindOptions.create
+        ~valueSet:
+          [ SymbolKind.File
+          ; Module
+          ; Namespace
+          ; Package
+          ; Class
+          ; Method
+          ; Property
+          ; Field
+          ; Constructor
+          ; Enum
+          ; Interface
+          ; Function
+          ; Variable
+          ; Constant
+          ; String
+          ; Number
+          ; Boolean
+          ; Array
+          ]
+        ()
+    in
+    let documentSymbol =
+      DocumentSymbolClientCapabilities.create
+        ~hierarchicalDocumentSymbolSupport:true
+        ~symbolKind
+        ()
+    in
+    let textDocument = TextDocumentClientCapabilities.create ~documentSymbol () in
+    ClientCapabilities.create ~textDocument ()
+  in
+  let request client =
+    let open Fiber.O in
+    let+ response = Util.call_document_symbol client in
+    print_result response
+  in
+  Helpers.test ~capabilities source request;
+  [%expect
+    {|
+    [
+      {
+        "children": [
+          {
+            "children": [],
+            "kind": 9,
+            "name": "A",
+            "range": {
+              "end": { "character": 10, "line": 0 },
+              "start": { "character": 9, "line": 0 }
+            },
+            "selectionRange": {
+              "end": { "character": 10, "line": 0 },
+              "start": { "character": 9, "line": 0 }
+            }
+          },
+          {
+            "children": [],
+            "kind": 9,
+            "name": "B",
+            "range": {
+              "end": { "character": 14, "line": 0 },
+              "start": { "character": 11, "line": 0 }
+            },
+            "selectionRange": {
+              "end": { "character": 14, "line": 0 },
+              "start": { "character": 13, "line": 0 }
+            }
+          }
+        ],
+        "kind": 5,
+        "name": "t",
+        "range": {
+          "end": { "character": 14, "line": 0 },
+          "start": { "character": 0, "line": 0 }
+        },
+        "selectionRange": {
+          "end": { "character": 6, "line": 0 },
+          "start": { "character": 5, "line": 0 }
+        }
+      },
+      {
+        "children": [],
+        "kind": 9,
+        "name": "E",
+        "range": {
+          "end": { "character": 11, "line": 1 },
+          "start": { "character": 0, "line": 1 }
+        },
+        "selectionRange": {
+          "end": { "character": 11, "line": 1 },
+          "start": { "character": 10, "line": 1 }
+        }
+      }
+    ]
     |}]
 ;;

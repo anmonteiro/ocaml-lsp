@@ -20,9 +20,23 @@ val contains_position : t -> Position.t -> inclusive_end:bool -> bool
     intersection. *)
 val intersection : t -> t -> t option
 
+(** [normalize_selection_range range ~selection] returns a selection range
+    that satisfies the specification requirement that the selection is
+    contained in [range]. Valid selections are preserved, non-empty overlaps
+    are clipped to the intersection, and reversed, touching, or disjoint
+    selections fall back to [range]. *)
+val normalize_selection_range : t -> selection:t -> t
+
 (** Whether two ranges overlap. With [touching] set, ranges that share only a
     boundary are also considered to overlap. *)
 val overlaps : t -> t -> touching:bool -> bool
 
 val first_line : t
+
+(** [resize_for_edit edit] returns the range of the text after [edit] has been
+    applied: the range's start is unchanged and the end is moved to the end of
+    the inserted text. This is the range that must be replaced to undo the
+    edit. *)
+val resize_for_edit : Types.TextEdit.t -> t
+
 val to_string : t -> string

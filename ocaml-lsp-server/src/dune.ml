@@ -27,6 +27,74 @@ module For_diff = struct
   let diagnostic_data t = fst view_promotion_capability, yojson_of_t t
 end
 
+module Promotion_tracker = struct
+  module Diagnostic_id = struct
+    module T = struct
+      include Drpc.Diagnostic.Id
+
+      let compare_ordering = compare
+      let compare left right = Ordering.to_int (compare_ordering left right)
+      let sexp_of_t = Sexplib0.Sexp_conv.sexp_of_opaque
+    end
+
+    include T
+    include Comparator.Make (T)
+  end
+
+  type t = { by_diagnostic : Drpc.Diagnostic.Promotion.t list Map.M(Diagnostic_id).t }
+
+  type event =
+    | Add of Drpc.Diagnostic.Promotion.t list
+    | Remove
+
+  let empty = { by_diagnostic = Map.empty (module Diagnostic_id) }
+
+  let active t =
+    (* Dune's promote RPC identifies a promotion only by [in_source] and chooses
+       between candidates itself. Until it can select a specific [in_build],
+       keep one representative per source for the single code action. Once the
+       API can distinguish candidates, expose each one as a separate action. *)
+    Map.fold
+      t.by_diagnostic
+      ~init:(Map.empty (module String))
+      ~f:(fun ~key:_ ~data:promotions active ->
+        List.fold_left promotions ~init:active ~f:(fun active promotion ->
+          Map.set
+            active
+            ~key:(Drpc.Diagnostic.Promotion.in_source promotion)
+            ~data:promotion))
+  ;;
+
+  let update t ~id event =
+    let by_diagnostic =
+      match event with
+      | Add promotions -> Map.set t.by_diagnostic ~key:id ~data:promotions
+      | Remove -> Map.remove t.by_diagnostic id
+    in
+    { by_diagnostic }
+  ;;
+
+  let diff previous current =
+    let previous = active previous in
+    let current = active current in
+    let add, remove =
+      Map.fold_symmetric_diff
+        previous
+        current
+        (* A different representative for an existing source does not change its
+           dynamic registration. *)
+        ~data_equal:(fun _ _ -> true)
+        ~init:([], [])
+        ~f:(fun (add, remove) (_, change) ->
+          match change with
+          | `Left promotion -> add, promotion :: remove
+          | `Right promotion -> promotion :: add, remove
+          | `Unequal _ -> assert false)
+    in
+    List.rev add, List.rev remove
+  ;;
+end
+
 module Chan : sig
   type t
 
@@ -141,6 +209,7 @@ module Instance : sig
   val create : Registry.Dune.t -> config -> t
   val promotions : t -> Drpc.Diagnostic.Promotion.t Map.M(String).t
   val client : t -> Client.t option
+  val lsp_of_dune : t -> Drpc.Diagnostic.t -> Uri.t * Diagnostic.t
 end = struct
   module Id = Id.Make ()
 
@@ -150,16 +219,14 @@ end = struct
     ; diagnostics_id : Diagnostics.Dune.t
     ; id : Id.t
     ; mutable client : Client.t option
-    ; mutable promotions :
-        (* TODO we need to clean these up in the finalizer *)
-        Drpc.Diagnostic.Promotion.t Map.M(String).t
+    ; mutable promotions : Promotion_tracker.t
     }
 
   type state =
     | Idle
     | Connected of Lev_fiber_csexp.Session.t * Drpc.Where.t
     | Running of running
-    | Finished
+    | Finished of Promotion_tracker.t
 
   type t =
     { config : config
@@ -169,19 +236,20 @@ end = struct
 
   let client t =
     match t.state with
-    | Connected _ | Idle | Finished -> None
+    | Connected _ | Idle | Finished _ -> None
     | Running r -> r.client
   ;;
 
   let promotions t =
     match t.state with
-    | Connected _ | Idle | Finished -> Map.empty (module String)
-    | Running r -> r.promotions
+    | Connected _ | Idle -> Map.empty (module String)
+    | Finished promotions -> Promotion_tracker.active promotions
+    | Running r -> Promotion_tracker.active r.promotions
   ;;
 
   let source t = t.source
 
-  let lsp_of_dune diagnostics ~include_promotions diagnostic =
+  let diagnostic_to_lsp diagnostics ~include_promotions ~uri diagnostic =
     let module D = Drpc.Diagnostic in
     let range_of_loc loc =
       let loc =
@@ -193,7 +261,7 @@ end = struct
     in
     let range =
       match D.loc diagnostic with
-      | None -> Lsp.Range.first_line
+      | None -> Range.first_line
       | Some loc -> range_of_loc loc
     in
     let severity =
@@ -220,6 +288,27 @@ end = struct
                Location.create ~uri ~range
              in
              DiagnosticRelatedInformation.create ~location ~message))
+    in
+    (* OCaml often reports the primary ml/mli mismatch location as a line with no
+       character span. Dune turns that into a zero-width range, which is useless in
+       editors. Prefer the first related location in the same document when that
+       happens. *)
+    let range =
+      let is_empty_range (range : Range.t) =
+        Lsp.Position.compare range.start range.end_ = 0
+      in
+      match is_empty_range range with
+      | false -> range
+      | true ->
+        (match relatedInformation with
+         | None -> range
+         | Some related ->
+           (match
+              List.find related ~f:(fun (related : DiagnosticRelatedInformation.t) ->
+                Uri.equal related.location.uri uri)
+            with
+            | Some related -> related.location.range
+            | None -> range))
     in
     let message = make_message (D.message diagnostic) in
     let tags = Diagnostics.tags_of_message diagnostics ~src:`Dune message in
@@ -263,6 +352,24 @@ end = struct
     trace ~message ~verbose
   ;;
 
+  let uri_of_dune t diagnostic =
+    match Drpc.Diagnostic.loc diagnostic with
+    | None -> Registry.Dune.root t.source |> Uri.of_path
+    | Some loc ->
+      let { Lexing.pos_fname; _ } = Drpc.Loc.start loc in
+      Uri.of_path pos_fname
+  ;;
+
+  let lsp_of_dune t diagnostic =
+    let uri = uri_of_dune t diagnostic in
+    ( uri
+    , diagnostic_to_lsp
+        t.config.diagnostics
+        ~include_promotions:t.config.include_promotions
+        ~uri
+        diagnostic )
+  ;;
+
   let progress_loop client diagnostics document_store progress trace source =
     (* We get all the progress updates even if the user can't see them to
        refresh the merlin config at the end of every build. Not very clean, but
@@ -289,7 +396,14 @@ end = struct
                        match Document.kind doc with
                        | `Other -> Fiber.return ()
                        | `Merlin merlin ->
-                         Diagnostics.merlin_diagnostics diagnostics merlin)
+                         let uri = Document.Merlin.to_doc merlin |> Document.uri in
+                         let generation =
+                           Diagnostics.begin_merlin_generation diagnostics uri
+                         in
+                         let+ (_ : bool) =
+                           Diagnostics.merlin_diagnostics diagnostics merlin ~generation
+                         in
+                         ())
                    in
                    Diagnostics.send diagnostics `All
                  | _ -> Fiber.return ())
@@ -297,76 +411,43 @@ end = struct
           Some ())
   ;;
 
-  let diagnostic_loop ~dune_root client config (running : running) diagnostics =
+  let diagnostic_loop t client config (running : running) diagnostics =
     let* res = Client.poll client Drpc.Sub.diagnostic in
     let send_diagnostics evs =
-      let promotions, add, remove =
+      let previous = running.promotions in
+      let promotions =
         List.fold_left
           evs
-          ~init:(running.promotions, [], [])
-          ~f:(fun (promotions, add, remove) (ev : Drpc.Diagnostic.Event.t) ->
-            let diagnostic =
-              match ev with
-              | Add x -> x
-              | Remove x -> x
+          ~init:previous
+          ~f:(fun promotions (ev : Drpc.Diagnostic.Event.t) ->
+            let id =
+              let diagnostic =
+                match ev with
+                | Add diagnostic | Remove diagnostic -> diagnostic
+              in
+              Drpc.Diagnostic.id diagnostic
             in
-            let id = Drpc.Diagnostic.id diagnostic in
-            let promotion = Drpc.Diagnostic.promotion diagnostic in
-            match ev with
-            | Remove _ ->
-              let promotions, requests =
-                List.fold_left
-                  promotion
-                  ~init:(promotions, [])
-                  ~f:(fun (ps, acc) promotion ->
-                    let source = Drpc.Diagnostic.Promotion.in_source promotion in
-                    match Map.find ps source with
-                    | Some _ -> Map.remove ps source, promotion :: acc
-                    | None ->
-                      Log.log ~section:"warning" (fun () ->
-                        Log.msg
-                          "removing non existant promotion"
-                          [ ( "promotion"
-                            , `String (Drpc.Diagnostic.Promotion.in_source promotion) )
-                          ]);
-                      ps, acc)
-              in
-              Diagnostics.remove diagnostics (`Dune (running.diagnostics_id, id));
-              promotions, add, requests :: remove
-            | Add d ->
-              let promotions, requests =
-                List.fold_left
-                  promotion
-                  ~init:(promotions, [])
-                  ~f:(fun (ps, acc) promotion ->
-                    let source = Drpc.Diagnostic.Promotion.in_source promotion in
-                    match Map.find ps source with
-                    | Some _ ->
-                      (* TODO it should not be possible to offer more than one
-                         promotion for a file in dune *)
-                      assert false
-                    | None -> Map.add_exn ps ~key:source ~data:promotion, promotion :: acc)
-              in
-              let uri : Uri.t =
-                match Drpc.Diagnostic.loc d with
-                | None -> dune_root
-                | Some loc ->
-                  let { Lexing.pos_fname; _ } = Drpc.Loc.start loc in
-                  Uri.of_path pos_fname
-              in
-              Diagnostics.set
-                diagnostics
-                (`Dune
-                    ( running.diagnostics_id
-                    , id
-                    , uri
-                    , lsp_of_dune
-                        diagnostics
-                        ~include_promotions:config.include_promotions
-                        d ));
-              promotions, requests :: add, remove)
+            let promotions =
+              Promotion_tracker.update
+                promotions
+                ~id
+                (match ev with
+                 | Add diagnostic ->
+                   Promotion_tracker.Add (Drpc.Diagnostic.promotion diagnostic)
+                 | Remove _ -> Remove)
+            in
+            (match ev with
+             | Remove _ ->
+               Diagnostics.remove diagnostics (`Dune (running.diagnostics_id, id))
+             | Add diagnostic ->
+               let uri, diagnostic = lsp_of_dune t diagnostic in
+               Diagnostics.set
+                 diagnostics
+                 (`Dune (running.diagnostics_id, id, uri, diagnostic)));
+            promotions)
       in
-      promotions, List.concat add, List.concat remove
+      let add, remove = Promotion_tracker.diff previous promotions in
+      promotions, add, remove
     in
     match res with
     | Error v -> raise (Drpc.Version_error.E v)
@@ -448,7 +529,7 @@ end = struct
           in
           t.config.log ~type_:Error ~message
       in
-      t.state <- Finished;
+      t.state <- Finished Promotion_tracker.empty;
       Error ()
     | Ok session ->
       let message =
@@ -481,7 +562,7 @@ end = struct
     let running =
       { chan
       ; finish
-      ; promotions = Map.empty (module String)
+      ; promotions = Promotion_tracker.empty
       ; client = None
       ; diagnostics_id = Diagnostics.Dune.gen (Pid.of_int (Registry.Dune.pid source))
       ; id = Id.gen ()
@@ -494,7 +575,6 @@ end = struct
     let* () =
       Fiber.all_concurrently_unit
         [ (let* () = Chan.run chan in
-           t.state <- Finished;
            Diagnostics.disconnect diagnostics running.diagnostics_id;
            let* () = Diagnostics.send diagnostics `All in
            Fiber.Ivar.fill finish ())
@@ -533,13 +613,27 @@ end = struct
                  config.trace
                  source
              in
-             let diagnostics =
-               let dune_root = DocumentUri.of_path (Registry.Dune.root source) in
-               diagnostic_loop ~dune_root client config running diagnostics
+             let diagnostics = diagnostic_loop t client config running diagnostics in
+             (* [Client.connect] joins this callback with its packet reader. If a
+                loop fails, close the channel so the reader can finish and the
+                error can propagate instead of leaving both fibers waiting. *)
+             let* result =
+               Fiber.map_reduce_errors
+                 (module Monoid.List (Exn_with_backtrace))
+                 (fun () ->
+                    Fiber.all_concurrently_unit
+                      [ progress; diagnostics; Fiber.Ivar.read finish ])
+                 ~on_error:(fun exn ->
+                   let+ () = Chan.stop chan in
+                   [ exn ])
              in
-             Fiber.all_concurrently_unit [ progress; diagnostics; Fiber.Ivar.read finish ]))
+             match result with
+             | Ok () -> Fiber.return ()
+             | Error errors -> Fiber.reraise_all errors))
         ]
     in
+    (* Snapshot after both fibers finish so finalization sees the last promotion set. *)
+    t.state <- Finished running.promotions;
     Progress.end_build_if_running progress
   ;;
 
@@ -561,7 +655,7 @@ end = struct
        | Error _ ->
          Jsonrpc.Response.Error.(
            raise (make ~message:"dune failed to format" ~code:InternalError ())))
-    | Connected _ | Idle | Finished | Running _ -> assert false
+    | Connected _ | Idle | Finished _ | Running _ -> assert false
   ;;
 end
 
@@ -609,38 +703,45 @@ let uri_dune_overlap =
     || List.is_prefix dune_root ~prefix:path ~equal:equal_path_component
 ;;
 
-let make_finalizer active (instance : Instance.t) =
-  Lazy_fiber.create (fun () ->
-    active.instances
-    <- Map.remove active.instances (Registry.Dune.root (Instance.source instance));
-    let to_unregister =
-      Instance.promotions instance
-      |> Map.data
-      |> List.map ~f:(fun promotion ->
-        let path = Drpc.Diagnostic.Promotion.in_source promotion in
-        Uri.of_path path)
-    in
-    Document_store.unregister_promotions active.config.document_store to_unregister)
-;;
-
-let run_instance active (instance : Instance.t) =
-  let cleanup = make_finalizer active instance in
+let run_with_cleanup ~run ~cleanup ~on_error =
+  let cleanup = Lazy_fiber.create cleanup in
   let* (_ : (unit, unit) result) =
     Fiber.map_reduce_errors
       (module Monoid.Unit)
-      (fun () -> Instance.run instance)
+      run
       ~on_error:(fun exn ->
-        let message =
-          Format.asprintf
-            "disconnected %s:@.%a"
-            (Registry.Dune.root (Instance.source instance))
-            Exn_with_backtrace.pp_uncaught
-            exn
-        in
-        let* () = active.config.log ~type_:Error ~message in
+        let* () = on_error exn in
         Lazy_fiber.force cleanup)
   in
   Lazy_fiber.force cleanup
+;;
+
+let cleanup_instance active (instance : Instance.t) =
+  active.instances
+  <- Map.remove active.instances (Registry.Dune.root (Instance.source instance));
+  let to_unregister =
+    Instance.promotions instance
+    |> Map.data
+    |> List.map ~f:(fun promotion ->
+      let path = Drpc.Diagnostic.Promotion.in_source promotion in
+      Uri.of_path path)
+  in
+  Document_store.unregister_promotions active.config.document_store to_unregister
+;;
+
+let run_instance active (instance : Instance.t) =
+  run_with_cleanup
+    ~run:(fun () -> Instance.run instance)
+    ~cleanup:(fun () -> cleanup_instance active instance)
+    ~on_error:(fun exn ->
+      let message =
+        Format.asprintf
+          "disconnected %s:@.%a"
+          (Registry.Dune.root (Instance.source instance))
+          Exn_with_backtrace.pp_uncaught
+          exn
+      in
+      active.config.log ~type_:Error ~message)
 ;;
 
 let poll active last_error =
@@ -680,8 +781,11 @@ let poll active last_error =
     active.instances <- remaining;
     let* connected =
       let to_create =
-        (* won't work very well with large workspaces and many instances of
-           dune *)
+        (* TODO We have no selection policy when multiple Dune instances register
+           the same root. Since [active.instances] is keyed by root, this picks the
+           first connectable registry entry in an unspecified order and silently
+           filters later entries once one becomes active. Track duplicates separately
+           and select an instance deterministically. *)
         let is_running dune = Map.mem active.instances (Registry.Dune.root dune) in
         Registry.current active.registry
         |> List.filter_map ~f:(fun dune ->
@@ -751,7 +855,8 @@ let poll active last_error =
                (* this is guaranteed not to raise since we don't connect to more
                   than one dune instance per workspace *)
                Map.add_exn acc ~key:(Registry.Dune.root source) ~data:instance);
-        Fiber.parallel_iter connected ~f:(run_instance active)
+        Fiber.parallel_iter connected ~f:(fun instance ->
+          Fiber.Pool.task active.pool ~f:(fun () -> run_instance active instance))
     in
     `No_error
 ;;
@@ -784,18 +889,10 @@ let create
   =
   let config =
     let include_promotions =
-      (let open Option.O in
-       let* td = client_capabilities.textDocument in
-       let* diagnostics = td.publishDiagnostics in
-       diagnostics.dataSupport)
-      |> Option.value ~default:false
-      &&
-      match client_capabilities.experimental with
-      | Some (`Assoc xs) ->
-        (match List.Assoc.find xs (fst view_promotion_capability) ~equal:String.equal with
-         | Some (`Bool b) -> b
-         | _ -> false)
-      | _ -> false
+      Capabilities.publish_diagnostics_data_support client_capabilities
+      && Experimental.bool
+           (Experimental.of_opt_json client_capabilities.experimental)
+           (fst view_promotion_capability)
     in
     { document_store; diagnostics; progress; include_promotions; log; trace }
   in
@@ -855,6 +952,11 @@ let update_workspaces t workspaces =
   | Active active -> active.workspaces <- workspaces
 ;;
 
+let instances_for_uri active uri =
+  Map.fold active.instances ~init:[] ~f:(fun ~key:_ ~data:instance acc ->
+    if uri_dune_overlap uri (Instance.source instance) then instance :: acc else acc)
+;;
+
 module Promote = struct
   module Input = struct
     type t =
@@ -883,16 +985,27 @@ module Promote = struct
 
   let name = "dune/promote"
 
-  let run t (command : ExecuteCommandParams.t) =
+  let input arguments =
+    let invalid () =
+      Jsonrpc.Response.Error.raise
+        (Jsonrpc.Response.Error.make
+           ~code:InvalidParams
+           ~message:"invalid Dune promotion arguments"
+           ())
+    in
+    match arguments with
+    | Some [ arg ] ->
+      (match Input.t_of_yojson arg with
+       | promote -> promote
+       | exception Json.Conv.Of_yojson_error _ -> invalid ())
+    | _ -> invalid ()
+  ;;
+
+  let run t (promote : Input.t) =
     Fiber.of_thunk (fun () ->
       match !t with
       | Closed -> Fiber.return ()
       | Active active ->
-        let promote =
-          match command.arguments with
-          | Some [ arg ] -> Input.t_of_yojson arg
-          | _ -> assert false
-        in
         (match Map.find active.instances promote.dune with
          | None ->
            let message = sprintf "dune %S already disconected" promote.dune in
@@ -955,15 +1068,17 @@ let on_command t (cmd : ExecuteCommandParams.t) =
     then
       Jsonrpc.Response.Error.raise
         (Jsonrpc.Response.Error.make ~code:InvalidRequest ~message:"invalid command" ());
-    let* () = Promote.run t cmd in
+    let promote = Promote.input cmd.arguments in
+    let* () = Promote.run t promote in
     Fiber.return `Null)
 ;;
 
 let for_doc t doc =
   match !t with
   | Closed -> []
-  | Active t ->
-    let uri = Document.Dune.uri doc in
-    Map.fold t.instances ~init:[] ~f:(fun ~key:_ ~data:instance acc ->
-      if uri_dune_overlap uri (Instance.source instance) then instance :: acc else acc)
+  | Active active -> instances_for_uri active (Document.Dune.uri doc)
 ;;
+
+module For_tests = struct
+  let run_with_cleanup = run_with_cleanup
+end

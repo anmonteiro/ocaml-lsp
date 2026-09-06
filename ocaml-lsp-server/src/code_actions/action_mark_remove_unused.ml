@@ -1,20 +1,34 @@
 open Import
 open Option.O
 
-let diagnostic_regex, diagnostic_regex_marks =
+(* Merlin warning descriptions are prefixed with a warning number. Classify
+   those diagnostics by number so arbitrary diagnostic text cannot be mistaken
+   for an unused warning. Dune diagnostics have bare descriptions, so retain the
+   textual fallback only for diagnostics whose source is Dune. *)
+let warning_kinds =
+  [ 11, `Case
+  ; 26, `Value
+  ; 27, `Value
+  ; 32, `Value
+  ; 33, `Open
+  ; 34, `Type
+  ; 35, `For_loop_index
+  ; 37, `Constructor
+  ; 38, `Extension
+  ; 39, `Rec
+  ; 60, `Module
+  ; 66, `Open_bang
+  ]
+;;
+
+let dune_diagnostic_regex, dune_diagnostic_regex_marks =
   let msgs =
-    ( Re.mark
-        (Re.alt
-           [ Re.str "Error (warning 26)"
-           ; Re.str "Error (warning 27)"
-           ; Re.str "unused value"
-           ])
-    , `Value )
-    :: ([ "unused open", `Open
-        ; "unused open!", `Open_bang
+    (Re.mark (Re.alt [ Re.str "unused value"; Re.str "unused variable" ]), `Value)
+    :: ([ "unused open!", `Open_bang
+        ; "unused open", `Open
         ; "unused type", `Type
-        ; "unused constructor", `Constructor
         ; "unused extension constructor", `Extension
+        ; "unused constructor", `Constructor
         ; "this match case is unused", `Case
         ; "unused for-loop index", `For_loop_index
         ; "unused rec flag", `Rec
@@ -29,25 +43,37 @@ let diagnostic_regex, diagnostic_regex_marks =
   regex, marks
 ;;
 
+let dune_diagnostic_kind message =
+  let* group = Re.exec_opt dune_diagnostic_regex message in
+  List.find_map dune_diagnostic_regex_marks ~f:(fun (mark, kind) ->
+    Option.some_if (Re.Mark.test group mark) kind)
+;;
+
 let find_unused_diagnostic pos ds =
-  let open Option.O in
   List.filter ds ~f:(fun (d : Diagnostic.t) ->
-    Lsp.Range.contains_position d.range pos ~inclusive_end:true)
+    Range.contains_position d.range pos ~inclusive_end:true)
   |> List.find_map ~f:(fun (d : Diagnostic.t) ->
-    let* group =
-      let message =
-        match d.message with
-        | `String m -> m
-        | `MarkupContent { value = m; _ } ->
-          (* TODO: this is wrong *)
-          m
-      in
-      Re.exec_opt diagnostic_regex message
+    let message =
+      match d.message with
+      | `String message -> message
+      | `MarkupContent { value = message; _ } ->
+        (* TODO: this is wrong *)
+        message
     in
-    let+ kind =
-      List.find_map diagnostic_regex_marks ~f:(fun (m, k) ->
-        Option.some_if (Re.Mark.test group m) k)
+    let kind =
+      match
+        List.find_map warning_kinds ~f:(fun (number, kind) ->
+          Option.some_if (Diagnostic_util.is_warning message ~number) kind)
+      with
+      | Some kind -> Some kind
+      | None ->
+        (match d.source with
+         | Some source
+           when String.equal source "dune" || String.is_prefix source ~prefix:"dune (pid="
+           -> dune_diagnostic_kind message
+         | None | Some _ -> None)
     in
+    let+ kind = kind in
     kind, d)
 ;;
 
@@ -201,25 +227,22 @@ let action_mark_type pipeline doc pos (d : Diagnostic.t) =
   create_mark_action ~title:"Mark type as unused" doc start d
 ;;
 
-let contains loc pos =
-  Lsp.Range.contains_position (Range.of_loc loc) pos ~inclusive_end:true
-;;
-
 let action_mark_for_loop_index pipeline doc pos (d : Diagnostic.t) =
   let open Option.O in
   let module I = Ocaml_parsing.Ast_iterator in
   let exception Found of Warnings.loc in
   let iterator =
     let expr iter (e : Parsetree.expression) =
-      if contains e.pexp_loc pos
+      if Range.contains_loc e.pexp_loc pos
       then (
         match e.pexp_desc with
-        | Pexp_for ({ ppat_loc; _ }, _, _, _, _) when contains ppat_loc pos ->
+        | Pexp_for ({ ppat_loc; _ }, _, _, _, _) when Range.contains_loc ppat_loc pos ->
           raise_notrace (Found ppat_loc)
         | _ -> I.default_iterator.expr iter e)
     in
     let structure_item iter (item : Parsetree.structure_item) =
-      if contains item.pstr_loc pos then I.default_iterator.structure_item iter item
+      if Range.contains_loc item.pstr_loc pos
+      then I.default_iterator.structure_item iter item
     in
     { I.default_iterator with expr; structure_item }
   in

@@ -71,6 +71,6 @@ let on_request ~params state =
       (Option.value ~default:(`Assoc []) params :> Yojson.Safe.t)
       |> Request_params.t_of_yojson
     in
-    let+ result = Definition_query.run ?prefix kind state uri position in
+    let+ result = Definition_query.run_primary ?prefix kind state uri position in
     yojson_of_t result)
 ;;

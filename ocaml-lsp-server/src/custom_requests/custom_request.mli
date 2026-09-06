@@ -4,6 +4,7 @@ module Construct = Req_construct
 module Hover_extended = Req_hover_extended
 module Infer_intf = Req_infer_intf
 module Merlin_call_compatible = Req_merlin_call_compatible
+module Merlin_configurations = Req_merlin_configurations
 module Switch_impl_intf = Req_switch_impl_intf
 module Typed_holes = Req_typed_holes
 module Jump_to_typed_hole = Req_jump_to_typed_hole

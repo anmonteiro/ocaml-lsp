@@ -8,14 +8,14 @@ type semantic_tokens_cache =
   ; tokens : int array
   }
 
-(** The following code attempts to resolve the issue of displaying code actions
-    for unopened document.
+(** Promote code actions may target files ocamllsp does not own (any path Dune
+    can promote). Editors only request actions for associated documents, so
+    closed promotion targets need a per-URI dynamic registration (DR).
 
-    Unopened documents require a dynamic registration (DR) for code actions,
-    while open documents do not.
+    Open documents already go through the static codeAction provider, so they
+    must not keep a DR.
 
-    Here are the four states of the documents and the DR status they require.
-    "X" marks that DR is required while "O" marks that no Dr should be present
+    "X" means DR is required; "O" means it must be absent:
 
     {v
                           | Open | Closed |
@@ -24,16 +24,14 @@ type semantic_tokens_cache =
       No Promotions       |  O   |   O    |
     v}
 
-    From the above, we see that we need to unregister when transitioning from X
-    to O and to register while transitioning from X to O. *)
+    Register on transitions into X; unregister on transitions out of X. *)
 
 type doc =
-  { (* invariant: if [document <> None], then no promotions are active *)
-    document : Document.t option
-  ; (* the number of associated promotions. when this is 0, we may unsubscribe
-       from code actions *)
+  { document : Document.t option
+  ; (* promotion refcount. dynamic registration is needed only while the
+       document is closed and this count is positive *)
     promotions : int
-  ; mutable semantic_tokens_cache : semantic_tokens_cache option
+  ; mutable semantic_tokens_cache : semantic_tokens_cache list
   }
 
 type t =
@@ -75,7 +73,10 @@ let register_request t uris =
         let registerOptions =
           let documentSelector =
             [ `TextDocumentFilter
-                (TextDocumentFilter.create ~pattern:(Uri.to_path uri) ())
+                (`TextDocumentFilterPattern
+                    (TextDocumentFilterPattern.create
+                       ~pattern:(`Pattern (Uri.to_path uri))
+                       ()))
             ]
           in
           CodeActionRegistrationOptions.create
@@ -101,7 +102,7 @@ let open_document t doc =
     Hashtbl.set
       t.db
       ~key
-      ~data:(ref { document = Some doc; promotions = 0; semantic_tokens_cache = None });
+      ~data:(ref { document = Some doc; promotions = 0; semantic_tokens_cache = [] });
     Fiber.return ()
   | Some d ->
     (* if there's no document, then we just opened it to track promotions.
@@ -152,7 +153,7 @@ let close_document t uri =
         Hashtbl.remove t.db uri;
         close_doc ())
       else (
-        doc := { !doc with document = None };
+        doc := { !doc with document = None; semantic_tokens_cache = [] };
         Fiber.fork_and_join_unit close_doc (fun () -> register_request t [ uri ])))
 ;;
 
@@ -163,8 +164,8 @@ let unregister_promotions t uris =
     | None -> false
     | Some doc ->
       doc := { !doc with promotions = !doc.promotions - 1 };
-      let unsubscribe = !doc.promotions = 0 in
-      if unsubscribe && !doc.document = None then Hashtbl.remove t.db uri;
+      let unsubscribe = !doc.promotions = 0 && !doc.document = None in
+      if unsubscribe then Hashtbl.remove t.db uri;
       unsubscribe)
   |> unregister_request t
 ;;
@@ -174,7 +175,7 @@ let register_promotions t uris =
   List.filter uris ~f:(fun uri ->
     match Hashtbl.find t.db uri with
     | None ->
-      let doc = ref { document = None; promotions = 1; semantic_tokens_cache = None } in
+      let doc = ref { document = None; promotions = 1; semantic_tokens_cache = [] } in
       Hashtbl.set t.db ~key:uri ~data:doc;
       true
     | Some doc ->
@@ -188,13 +189,29 @@ let update_semantic_tokens_cache
   =
   fun t uri ~resultId ~tokens ->
   let doc = get' t uri in
-  !doc.semantic_tokens_cache <- Some { resultId; tokens }
+  let cache =
+    { resultId; tokens }
+    :: List.filter !doc.semantic_tokens_cache ~f:(fun cached ->
+      not (String.equal cached.resultId resultId))
+  in
+  !doc.semantic_tokens_cache <- List.take cache 2
 ;;
 
-let get_semantic_tokens_cache : t -> Uri.t -> semantic_tokens_cache option =
-  fun t uri ->
+let get_semantic_tokens_cache
+  : t -> Uri.t -> resultId:string -> semantic_tokens_cache option
+  =
+  fun t uri ~resultId ->
   let doc = get' t uri in
-  !doc.semantic_tokens_cache
+  let rec find previous = function
+    | [] -> None
+    | cached :: rest ->
+      if String.equal cached.resultId resultId
+      then (
+        !doc.semantic_tokens_cache <- cached :: List.rev_append previous rest;
+        Some cached)
+      else find (cached :: previous) rest
+  in
+  find [] !doc.semantic_tokens_cache
 ;;
 
 let parallel_iter t ~f =

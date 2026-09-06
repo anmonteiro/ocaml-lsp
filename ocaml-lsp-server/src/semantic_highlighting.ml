@@ -15,6 +15,7 @@ module Token_type : sig
   type t
 
   val of_builtin : SemanticTokenTypes.t -> t
+  val of_index : int -> t
   val module_ : t
   val module_type : t
   val to_int : t -> int
@@ -54,6 +55,8 @@ end = struct
     ]
   ;;
 
+  let of_index index = List.nth_exn legend index
+
   let tokenTypes : string list =
     List.map legend ~f:(fun s ->
       match SemanticTokenTypes.yojson_of_t s with
@@ -83,6 +86,7 @@ module Token_modifiers_set : sig
   type t
 
   val to_int : t -> int
+  val of_int : int -> t
   val singleton : SemanticTokenModifiers.t -> t
   val empty : t
   val list : string list
@@ -91,6 +95,7 @@ end = struct
   type t = int
 
   let to_int x = x
+  let of_int x = x
   let empty = 0
 
   let singleton : SemanticTokenModifiers.t -> t = function
@@ -179,16 +184,22 @@ let make_config ~token_types ~token_modifiers =
   { legend; token_type_indices; token_modifier_bits }
 ;;
 
-let create_config (semantic_tokens : SemanticTokensClientCapabilities.t) =
+let config_of_client_values ~token_types ~token_modifiers =
   let token_types =
     List.filter Token_type.tokenTypes ~f:(fun value ->
-      List.mem semantic_tokens.tokenTypes value ~equal:String.equal)
+      List.mem token_types value ~equal:String.equal)
   in
   let token_modifiers =
     List.filter Token_modifiers_set.list ~f:(fun value ->
-      List.mem semantic_tokens.tokenModifiers value ~equal:String.equal)
+      List.mem token_modifiers value ~equal:String.equal)
   in
   make_config ~token_types ~token_modifiers
+;;
+
+let create_config (semantic_tokens : SemanticTokensClientCapabilities.t) =
+  config_of_client_values
+    ~token_types:semantic_tokens.tokenTypes
+    ~token_modifiers:semantic_tokens.tokenModifiers
 ;;
 
 let default_config =
@@ -201,7 +212,7 @@ let token_type_index config token_type =
   config.token_type_indices.(Token_type.to_int token_type)
 ;;
 
-let token_modifiers_bitset config token_modifiers =
+let remap_token_modifiers config encoded =
   let rec loop server_index encoded result =
     if Int.equal encoded 0
     then result
@@ -216,7 +227,11 @@ let token_modifiers_bitset config token_modifiers =
       in
       loop (server_index + 1) (encoded lsr 1) result)
   in
-  loop 0 (Token_modifiers_set.to_int token_modifiers) 0
+  loop 0 encoded 0
+;;
+
+let token_modifiers_bitset config token_modifiers =
+  remap_token_modifiers config (Token_modifiers_set.to_int token_modifiers)
 ;;
 
 (** Represents a collection of semantic tokens. *)
@@ -235,6 +250,7 @@ module Tokens : sig
     -> unit
 
   val yojson_of_t : t -> Yojson.Safe.t
+  val intersection : t list -> t
   val encode : t -> config -> int array
 end = struct
   type token =
@@ -304,6 +320,17 @@ end = struct
   ;;
 
   let yojson_of_t t = Json.Conv.yojson_of_list yojson_of_token (List.rev t.tokens)
+
+  let intersection = function
+    | [] -> create ()
+    | first :: rest ->
+      let tokens =
+        List.filter first.tokens ~f:(fun token ->
+          List.for_all rest ~f:(fun tokens ->
+            List.exists tokens.tokens ~f:(fun candidate -> Poly.equal token candidate)))
+      in
+      { tokens }
+  ;;
 
   let encode (t : t) (config : config) : int array =
     (* The parsetree traversal does not always visit nodes in source order. This
@@ -882,6 +909,18 @@ end = struct
     | `Default_iterator -> Ast_iterator.default_iterator.module_expr self me
   ;;
 
+  (* An open in a structure reaches [module_expr], but one in a signature is an
+     [open_description], which the default iterator does not route through any
+     overridden method. *)
+  let open_description
+        (self : Ast_iterator.iterator)
+        ({ popen_expr; popen_attributes; popen_override = _; popen_loc = _ } :
+          Parsetree.open_description)
+    =
+    lident popen_expr Token_type.module_ ();
+    self.attributes self popen_attributes
+  ;;
+
   let module_type_declaration
         (self : Ast_iterator.iterator)
         ({ pmtd_name; pmtd_type; pmtd_attributes; pmtd_loc = _ } :
@@ -957,6 +996,21 @@ end = struct
     | `Default_iterator -> Ast_iterator.default_iterator.module_type self mt
   ;;
 
+  (* [Pmty_with] is left to the default iterator, which dispatches each
+     constraint here. Without this the constrained names receive no token. *)
+  let with_constraint (self : Ast_iterator.iterator) (wc : Parsetree.with_constraint) =
+    match wc with
+    | Pwith_type (l, td) | Pwith_typesubst (l, td) ->
+      lident l (Token_type.of_builtin Type) ();
+      self.type_declaration self td
+    | Pwith_module (l, l') | Pwith_modsubst (l, l') ->
+      lident l Token_type.module_ ();
+      lident l' Token_type.module_ ()
+    | Pwith_modtype (l, mt) | Pwith_modtypesubst (l, mt) ->
+      lident l Token_type.module_type ();
+      self.module_type self mt
+  ;;
+
   (* TODO: *)
   let attribute _self _attr = ()
 
@@ -980,6 +1034,8 @@ end = struct
     ; value_description
     ; module_type
     ; module_declaration
+    ; with_constraint
+    ; open_description
     }
   ;;
 
@@ -1001,16 +1057,62 @@ let gen_new_id =
     string_of_int x
 ;;
 
-let compute_tokens doc =
-  let+ parsetree, source =
-    Document.Merlin.with_pipeline_exn ~name:"semantic highlighting" doc (fun p ->
-      Mpipeline.reader_parsetree p, Mpipeline.input_source p)
-  in
+let compute_tokens_in_pipeline pipeline =
+  let parsetree = Mpipeline.reader_parsetree pipeline in
+  let source = Mpipeline.input_source pipeline in
   let module Fold = Parsetree_fold (struct
       let source = Msource.text source
     end)
   in
   Fold.apply parsetree
+;;
+
+let compute_primary_tokens doc =
+  let* { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn doc
+  in
+  let configuration = Merlin_config.primary configurations in
+  let doc =
+    Document.Merlin.to_doc doc
+    |> (fun doc -> Document.with_merlin_configuration doc configuration)
+    |> Document.merlin_exn
+  in
+  Document.Merlin.with_pipeline_exn ~name:"semantic highlighting" doc (fun pipeline ->
+    compute_tokens_in_pipeline pipeline)
+;;
+
+let compute_tokens doc =
+  let* { Document.Merlin.configurations; _ } =
+    Document.Merlin.configuration_context_exn doc
+  in
+  let+ results =
+    Document.Merlin.with_configurations
+      ~name:"semantic highlighting"
+      doc
+      ~configurations
+      (fun _ pipeline -> compute_tokens_in_pipeline pipeline)
+  in
+  let results = Merlin_dot_protocol.Nonempty_list.to_list results in
+  let errors, tokens =
+    List.fold_left results ~init:([], []) ~f:(fun (errors, tokens) result ->
+      let { Document.Merlin.configuration; result } = result in
+      match result with
+      | Ok result -> errors, result :: tokens
+      | Error error -> (configuration, error) :: errors, tokens)
+  in
+  match errors with
+  | [] -> Tokens.intersection (List.rev tokens)
+  | errors ->
+    let modes =
+      List.rev_map errors ~f:(fun (configuration, _) ->
+        Merlin_config.configuration_label configuration)
+      |> String.concat ~sep:", "
+    in
+    Jsonrpc.Response.Error.raise
+      (Jsonrpc.Response.Error.make
+         ~code:RequestFailed
+         ~message:(sprintf "Semantic tokens failed for modes: %s" modes)
+         ())
 ;;
 
 let compute_encoded_tokens config doc =
@@ -1019,12 +1121,10 @@ let compute_encoded_tokens config doc =
 ;;
 
 let client_config state =
-  let semantic_tokens =
-    let open Option.O in
-    let* text_document = (State.client_capabilities state).textDocument in
-    text_document.semanticTokens
-  in
-  Option.value_map semantic_tokens ~default:default_config ~f:create_config
+  Option.value_map
+    (Capabilities.semantic_tokens (State.client_capabilities state))
+    ~default:default_config
+    ~f:create_config
 ;;
 
 (** Contains implementation of a custom request that provides human-readable
@@ -1055,7 +1155,7 @@ module Debug = struct
                 ~message:"expected a merlin document"
                 ()
          | `Merlin merlin ->
-           let+ tokens = compute_tokens merlin in
+           let+ tokens = compute_primary_tokens merlin in
            Tokens.yojson_of_t tokens))
   ;;
 end
@@ -1125,16 +1225,28 @@ let find_diff ~(old : int array) ~(new_ : int array) : SemanticTokensEdit.t list
 ;;
 
 module For_tests = struct
-  let token_type = Token_type.of_builtin Variable
-  let token_type_index = Token_type.to_int token_type
-  let token_modifiers = Token_modifiers_set.empty
-  let token_modifiers_bitset = Token_modifiers_set.to_int token_modifiers
+  type nonrec config = config
 
-  let encode tokens =
+  let server_token_types = Token_type.tokenTypes
+  let server_token_modifiers = Token_modifiers_set.list
+  let create_config = config_of_client_values
+  let legend config = config.legend
+  let default_token_type = Token_type.of_builtin Variable
+  let token_type_index = Token_type.to_int default_token_type
+  let token_modifiers_bitset = Token_modifiers_set.to_int Token_modifiers_set.empty
+
+  let encode
+        ?(config = default_config)
+        ?(token_type_index = token_type_index)
+        ?(token_modifiers = token_modifiers_bitset)
+        tokens
+    =
+    let token_type = Token_type.of_index token_type_index in
+    let token_modifiers = Token_modifiers_set.of_int token_modifiers in
     let encoded = Tokens.create () in
     List.iter tokens ~f:(fun (start, length) ->
       Tokens.append_token' encoded start ~length token_type token_modifiers);
-    Tokens.encode encoded default_config
+    Tokens.encode encoded config
   ;;
 
   let find_diff = find_diff
@@ -1160,14 +1272,17 @@ let on_request_full_delta
       let+ tokens = compute_encoded_tokens (client_config state) doc in
       let resultId = gen_new_id () in
       let cached_token_info =
-        Document_store.get_semantic_tokens_cache state.store params.textDocument.uri
+        Document_store.get_semantic_tokens_cache
+          state.store
+          params.textDocument.uri
+          ~resultId:params.previousResultId
       in
       Document_store.update_semantic_tokens_cache store uri ~resultId ~tokens;
       (match cached_token_info with
-       | Some cached_v when String.equal cached_v.resultId params.previousResultId ->
+       | Some cached_v ->
          let edits = find_diff ~old:cached_v.tokens ~new_:tokens in
          Some
            (`SemanticTokensDelta { SemanticTokensDelta.resultId = Some resultId; edits })
-       | Some _ | None ->
+       | None ->
          Some (`SemanticTokens { SemanticTokens.resultId = Some resultId; data = tokens })))
 ;;

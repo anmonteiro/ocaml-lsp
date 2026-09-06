@@ -2,6 +2,10 @@
 
 ## Features
 
+- Support `ocp-indent` as an alternative for document and range formatting.
+  (#2148, @rgrinberg)
+- Support `textDocument/onTypeFormatting` through the optional, persistent
+  `ocp-indent-rpc` helper. (#1986, @rgrinberg)
 - Report Dune RPC, build progress, and Merlin configuration process activity
   through LSP trace notifications. (#1899, @rgrinberg)
 - Add a code action to open the closest Dune file for the current document.
@@ -10,6 +14,60 @@
 
 ## Fixes
 
+- Ensure recovered selection ranges contain the requested position. (#2170,
+  @rgrinberg)
+- Suppress function extraction when a constructor would move out of scope or
+  resolve to a shadowing declaration. (#2169, @rgrinberg)
+- Clamp recovered selection ranges to the document bounds. (#2061, @rgrinberg)
+- Exclude symbol declarations from reference results when requested by the
+  client. (#2164, @rgrinberg)
+- Convert related locations parsed from Merlin diagnostic messages to zero-based
+  LSP line numbers. (#2163, fixes #2145, @rgrinberg)
+- Preserve trailing newlines when computing post-edit ranges. (#2159,
+  @rgrinberg)
+- Return only inlay hints within the range requested by the client. (#2155,
+  @rgrinberg)
+- Return document symbol kinds the client supports, falling back to
+  `Constructor` and `Class` when it does not advertise the newer kinds.
+  (#2122, fixes #2121, @dayangac)
+- Offer the unused-code quick fixes again: they matched diagnostic messages the
+  server does not emit, and marking an unused `open!` produced `open!!`.
+  (#2117, fixes #2116, @dayangac)
+- Offer to create a missing implementation or interface counterpart only when
+  the client supports the create resource operation. (#2115, fixes #2114,
+  @dayangac)
+- Tag unused and deprecated values in diagnostics, so clients can grey them out
+  or strike them through. (#2110, fixes #2109, @dayangac)
+- Honor client support for deprecation tags in workspace-symbol results.
+  (#2113, @rgrinberg)
+- Respect the client's folding range capabilities: omit character positions for
+  `lineFoldingOnly` clients, omit unsupported folding range kinds, and honor
+  `rangeLimit`. (#2099, fixes #911, @dayangac)
+- Classify module names in `with` constraints and in signature `open`s in
+  semantic highlighting. (#2098, fixes #808, @dayangac)
+- Report a type when hovering a variant constructor or an exception where it is
+  declared. (#2102, fixes #1300, @dayangac)
+- Return no location instead of failing the request when a definition,
+  declaration or type definition cannot be found, so clients that request them
+  eagerly no longer surface spurious errors. (#2100, fixes #1161, @dayangac)
+- Prefer a same-document related location when a Dune diagnostic has an empty
+  primary range, such as ml/mli mismatches. (#2093, @rgrinberg)
+- Stop offering the inferred-interface code action when the interface already
+  declares everything the implementation exports. (#2096, fixes #347, @dayangac)
+- Unregister Dune promotion code actions when an RPC instance finishes.
+  (#2076, @rgrinberg)
+- Avoid unregistering promotion code actions when clearing the last promotion
+  for an already open document. (#2075, @rgrinberg)
+- Keep Dune RPC registry polling responsive while connected instances are
+  running. (#1919, @rgrinberg)
+- Fix the build on FreeBSD, where `statfs(2)` is declared in `<sys/mount.h>`
+  rather than `<sys/statfs.h>`. (#2070, fixes #1069, @dayangac)
+- Deduplicate identical rename text edits returned by Merlin recovery.
+  (#2064, @rgrinberg)
+- Reject cross-line destruct recovery locations before applying line-local
+  source offsets. (#2063, @rgrinberg)
+- Use consistent document snapshots and versions when converting rename
+  occurrences into workspace edits. (#2062, @rgrinberg)
 - Keep construct-completion text edits on the request line when Merlin recovery
   returns a multiline location. (#2034, @rgrinberg)
 - Advertise Dune promotion code actions using their returned `quickfix` kind.
@@ -27,6 +85,8 @@
 - Preserve deprecation status in workspace-symbol results. (#2044, @rgrinberg)
 - Render empty odoc tables in hover documentation without raising an internal
   error. (#2038, @rgrinberg)
+- Enable function parameter inlay hints when the client sends no configuration.
+  (#2097, fixes #1371, @dayangac)
 - Respect client support for signature-help parameter-label offsets. (#2009,
   @rgrinberg)
 - Keep Merlin diagnostic ranges within document bounds. (#2008, @rgrinberg)
@@ -45,6 +105,11 @@
   @rgrinberg)
 - Use each document's current version in multi-file rename edits. (#1958, @rgrinberg)
 - Handle zero-work Dune build progress updates. (#1896, @rgrinberg)
+- Do not report Dune build progress when the client disables work-done progress.
+  (#2082, @rgrinberg)
+- Reject malformed Dune promotion commands. (#2084, @rgrinberg)
+- Keep Dune promotion registrations balanced when diagnostics share a source.
+  (#2089, @rgrinberg)
 - Reject negative JSON-RPC `Content-Length` headers. (#1873, @rgrinberg)
 - Report unsupported LSP request methods as unavailable instead of internal
   server errors. (#1862, @rgrinberg)
@@ -60,6 +125,8 @@
   (#1860, @rgrinberg)
 - Advertise and encode only semantic token modifiers supported by the client.
   (#1978, @rgrinberg)
+- Offer the `destruct-line` code action on inline match expressions with
+  incomplete cases. (#1829, fixes #1595, @rgrinberg)
 - Replace a lone polymorphic-variant backtick when applying completions.
   (#1823, fixes #1427, @rgrinberg)
 - Report a missing project build-system executable as a diagnostic without
@@ -70,6 +137,8 @@
   within its `range`, so clients no longer reject the document outline.
   (#1775, fixes #1560, @Leonard013)
 - Recompute Merlin diagnostics when diagnostic shortening changes. (#1804, @rgrinberg)
+- Avoid eagerly computing inline code-action edits when clients support lazy
+  resolution. (#1808, @rgrinberg)
 - Keep URI query parameters separate from filesystem paths. (#1776, @rgrinberg)
 - Preserve URI paths beginning with two slashes across serialization. (#1798, @rgrinberg)
 - Preserve percent-encoded URI fragments across parsing and serialization. (#1801, @rgrinberg)

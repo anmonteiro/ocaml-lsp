@@ -1,5 +1,5 @@
 open Import
-include Lsp.Types.Position
+include Lsp.Position
 
 let to_dyn { line; character } =
   Dyn.record [ "line", Dyn.int line; "character", Dyn.int character ]
@@ -25,13 +25,12 @@ let of_lexical_position (lex_position : Lexing.position) : t option =
           ; "pos_bol", `Int lex_position.pos_bol
           ; "pos_cnum", `Int lex_position.pos_cnum
           ]);
-    let line = max line 0 in
-    let character = max character 0 in
+    let line = Int.max line 0 in
+    let character = Int.max character 0 in
     Some { line; character })
 ;;
 
 let logical position =
-  let line = position.line + 1 in
-  let col = position.character in
-  `Logical (line, col)
+  let line, character = to_logical position in
+  `Logical (line, character)
 ;;

@@ -2,6 +2,11 @@ open! Import
 open Types
 open Extension
 
+type workspace_symbol_result =
+  [ `SymbolInformation of SymbolInformation.t list
+  | `WorkspaceSymbol of WorkspaceSymbol.t list
+  ]
+
 type _ t =
   | Shutdown : unit t
   | Initialize : InitializeParams.t -> InitializeResult.t t
@@ -13,7 +18,7 @@ type _ t =
   | TextDocumentCompletion :
       CompletionParams.t
       -> [ `CompletionList of CompletionList.t | `List of CompletionItem.t list ] option t
-  | TextDocumentCodeLens : CodeLensParams.t -> CodeLens.t list t
+  | TextDocumentCodeLens : CodeLensParams.t -> CodeLens.t list option t
   | InlayHint : InlayHintParams.t -> InlayHint.t list option t
   | InlayHintResolve : InlayHint.t -> InlayHint.t t
   | TextDocumentDiagnostic : DocumentDiagnosticParams.t -> DocumentDiagnosticReport.t t
@@ -39,7 +44,7 @@ type _ t =
   | TextDocumentRangesFormatting :
       DocumentRangesFormattingParams.t
       -> TextEdit.t list option t
-  | TextDocumentRename : RenameParams.t -> WorkspaceEdit.t t
+  | TextDocumentRename : RenameParams.t -> WorkspaceEdit.t option t
   | TextDocumentLink : DocumentLinkParams.t -> DocumentLink.t list option t
   | TextDocumentLinkResolve : DocumentLink.t -> DocumentLink.t t
   | TextDocumentMoniker : MonikerParams.t -> Moniker.t list option t
@@ -50,7 +55,7 @@ type _ t =
          ]
            option
            t
-  | WorkspaceSymbol : WorkspaceSymbolParams.t -> SymbolInformation.t list option t
+  | WorkspaceSymbol : WorkspaceSymbolParams.t -> workspace_symbol_result option t
   | WorkspaceSymbolResolve : WorkspaceSymbol.t -> WorkspaceSymbol.t t
   | DebugEcho : DebugEcho.Params.t -> DebugEcho.Result.t t
   | DebugTextDocumentGet :
@@ -59,7 +64,7 @@ type _ t =
   | TextDocumentReferences : ReferenceParams.t -> Location.t list option t
   | TextDocumentHighlight : DocumentHighlightParams.t -> DocumentHighlight.t list option t
   | TextDocumentFoldingRange : FoldingRangeParams.t -> FoldingRange.t list option t
-  | SignatureHelp : SignatureHelpParams.t -> SignatureHelp.t t
+  | SignatureHelp : SignatureHelpParams.t -> SignatureHelp.t option t
   | CodeAction : CodeActionParams.t -> CodeActionResult.t t
   | CodeActionResolve : CodeAction.t -> CodeAction.t t
   | CompletionItemResolve : CompletionItem.t -> CompletionItem.t t
@@ -74,7 +79,7 @@ type _ t =
       ColorPresentationParams.t
       -> ColorPresentation.t list t
   | TextDocumentColor : DocumentColorParams.t -> ColorInformation.t list t
-  | SelectionRange : SelectionRangeParams.t -> SelectionRange.t list t
+  | SelectionRange : SelectionRangeParams.t -> SelectionRange.t list option t
   | ExecuteCommand : ExecuteCommandParams.t -> Json.t t
   | SemanticTokensFull : SemanticTokensParams.t -> SemanticTokens.t option t
   | SemanticTokensDelta :

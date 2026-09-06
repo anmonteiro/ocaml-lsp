@@ -21,6 +21,8 @@ let%expect_test "promotion removal while its document is open" =
            Events.wait_for_diagnostics events.dune ~f:(fun params ->
              for_uri initial.uri params && no_dune_diagnostic params)
          in
+         (* Negative check: with the document open, clearing the last promotion
+            must not emit another unregister. Drain the registration pool. *)
          let* () = Lev_fiber.Timer.sleepf 0.01 in
          print_payload
            project
@@ -69,9 +71,7 @@ let%expect_test "promotion removal while its document is open" =
           "method": "textDocument/codeAction",
           "registerOptions": {
             "codeActionKinds": [ "quickfix" ],
-            "documentSelector": [
-              { "language": null, "scheme": null, "pattern": "<document-path>" }
-            ]
+            "documentSelector": [ { "pattern": "<document-path>" } ]
           }
         }
       ]
@@ -88,15 +88,6 @@ let%expect_test "promotion removal while its document is open" =
     Dune diagnostics after removing the promotion:
     { "diagnostics": [], "uri": "<document-uri>" }
     client/unregisterCapability after removing the promotion:
-    [
-      {
-        "unregisterations": [
-          {
-            "id": "ocamllsp-promote/<document-uri>",
-            "method": "textDocument/codeAction"
-          }
-        ]
-      }
-    ]
+    []
     |}]
 ;;

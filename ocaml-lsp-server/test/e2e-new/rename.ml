@@ -15,9 +15,12 @@ let prepare_rename client position =
 
 let rename ?(newName = "new_num") client position =
   let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
-  Client.request
-    client
-    (TextDocumentRename (RenameParams.create ~textDocument ~position ~newName ()))
+  let+ result =
+    Client.request
+      client
+      (TextDocumentRename (RenameParams.create ~textDocument ~position ~newName ()))
+  in
+  Option.value_exn result
 ;;
 
 let print_prepare_rename = function
@@ -42,6 +45,17 @@ let run ?(documentChanges = false) source f =
   Helpers.test ~capabilities:(capabilities ~documentChanges) source f
 ;;
 
+let test_rename ~newName source_with_cursor =
+  let source, position = Test.parse_cursor source_with_cursor in
+  run source (fun client ->
+    let+ response = rename ~newName client position in
+    (match response.changes with
+     | Some [ (_, edits) ] -> edits
+     | None | Some _ -> failwith "expected edits for one document")
+    |> Test.apply_edits source
+    |> print_string)
+;;
+
 let rename_source =
   {ocaml|let num = 42
 let num = num + 13
@@ -51,13 +65,11 @@ let num2 = num
 
 let%expect_test "can reject invalid rename request" =
   run rename_source (fun client ->
-    let* response = prepare_rename client (Position.create ~line:0 ~character:1) in
-    print_prepare_rename response;
-    Fiber.return ());
+    Position.create ~line:0 ~character:1 |> prepare_rename client >>| print_prepare_rename);
   [%expect {| null |}]
 ;;
 
-let%expect_test "prepare rename leaks a lexer error on an astral character" =
+let%expect_test "prepare rename reports a mode failure on an astral character" =
   run "😀" (fun client ->
     let* result =
       Fiber.collect_errors (fun () ->
@@ -72,56 +84,40 @@ let%expect_test "prepare rename leaks a lexer error on an astral character" =
     | Ok response ->
       print_prepare_rename response;
       Fiber.return ());
+  [%expect {| { "code": -32803, "message": "prepare rename failed for modes: legacy" } |}]
+;;
+
+let%expect_test "prepare rename leaks Not_found on an incomplete local module" =
+  run "let module X" (fun client ->
+    Fiber.collect_errors (fun () ->
+      prepare_rename client (Position.create ~line:0 ~character:12))
+    >>= function
+    | Error [ { Exn_with_backtrace.exn = Jsonrpc.Response.Error.E error; backtrace = _ } ]
+      ->
+      Jsonrpc.Response.Error.yojson_of_t error |> censor_backtraces |> Test.print_result;
+      Fiber.return ()
+    | Error errors -> Fiber.reraise_all errors
+    | Ok response ->
+      print_prepare_rename response;
+      Fiber.return ());
   [%expect
     {|
     {
-      "data": {
-        "exn": "Ocaml_preprocess.Lexer_raw.Error(_, _)",
-        "backtrace": "<censored>"
-      },
+      "data": { "exn": "Not_found", "backtrace": "<censored>" },
       "code": -32603,
       "message": "uncaught exception"
     }
     |}]
 ;;
 
-let%expect_test "rename returns overlapping edits for an incomplete binding" =
-  run "let rec ma" (fun client ->
-    let* response =
-      rename ~newName:"fuzz_renamed" client (Position.create ~line:0 ~character:10)
-    in
-    print_workspace_edit response;
-    Fiber.return ());
-  [%expect
-    {|
-    {
-      "changes": {
-        "file:///test.ml": [
-          {
-            "newText": "fuzz_renamed",
-            "range": {
-              "end": { "character": 10, "line": 0 },
-              "start": { "character": 8, "line": 0 }
-            }
-          },
-          {
-            "newText": "fuzz_renamed",
-            "range": {
-              "end": { "character": 10, "line": 0 },
-              "start": { "character": 8, "line": 0 }
-            }
-          }
-        ]
-      }
-    }
-    |}]
+let%expect_test "rename deduplicates edits for an incomplete binding" =
+  test_rename ~newName:"fuzz_renamed" "let rec ma$";
+  [%expect {| let rec fuzz_renamed |}]
 ;;
 
 let%expect_test "allows valid rename request" =
   run rename_source (fun client ->
-    let* response = prepare_rename client (Position.create ~line:0 ~character:4) in
-    print_prepare_rename response;
-    Fiber.return ());
+    prepare_rename client (Position.create ~line:0 ~character:4) >>| print_prepare_rename);
   [%expect
     {|
     {
@@ -184,45 +180,47 @@ let b = (^*$) 1
 ;;
 
 let%expect_test "rename record-punned variable also renames the field" =
-  let source =
+  test_rename
+    ~newName:"y"
     {ocaml|type t = { x : int }
-let f x = { x }
-|ocaml}
-  in
-  run source (fun client ->
-    let* response = rename ~newName:"y" client (Position.create ~line:1 ~character:6) in
-    print_workspace_edit response;
-    Fiber.return ());
+let f $x = { x }
+|ocaml};
   [%expect
     {|
-    {
-      "changes": {
-        "file:///test.ml": [
-          {
-            "newText": "y",
-            "range": {
-              "end": { "character": 13, "line": 1 },
-              "start": { "character": 12, "line": 1 }
-            }
-          },
-          {
-            "newText": "y",
-            "range": {
-              "end": { "character": 7, "line": 1 },
-              "start": { "character": 6, "line": 1 }
-            }
-          }
-        ]
-      }
-    }
+    type t = { x : int }
+    let f y = { y }
+    |}]
+;;
+
+let%expect_test "rename record-punned pattern variable also renames the field" =
+  test_rename
+    ~newName:"y"
+    {ocaml|type t = { x : int }
+let get { $x } = x
+|ocaml};
+  [%expect
+    {|
+    type t = { x : int }
+    let get { y } = y
+    |}]
+;;
+
+let%expect_test "rename record field also renames a punned variable" =
+  test_rename
+    ~newName:"y"
+    {ocaml|type t = { $x : int }
+let f x = { x }
+|ocaml};
+  [%expect
+    {|
+    type t = { y : int }
+    let f x = { y }
     |}]
 ;;
 
 let%expect_test "rename value in a file without documentChanges capability" =
   run rename_source (fun client ->
-    let* response = rename client (Position.create ~line:0 ~character:4) in
-    print_workspace_edit response;
-    Fiber.return ());
+    Position.create ~line:0 ~character:4 |> rename client >>| print_workspace_edit);
   [%expect
     {|
     {
@@ -250,9 +248,7 @@ let%expect_test "rename value in a file without documentChanges capability" =
 
 let%expect_test "rename value in a file with documentChanges capability" =
   run ~documentChanges:true rename_source (fun client ->
-    let* response = rename client (Position.create ~line:0 ~character:4) in
-    print_workspace_edit response;
-    Fiber.return ());
+    Position.create ~line:0 ~character:4 |> rename client >>| print_workspace_edit);
   [%expect
     {|
     {
@@ -282,95 +278,60 @@ let%expect_test "rename value in a file with documentChanges capability" =
 ;;
 
 let%expect_test "rename a var used as a labelled argument" =
-  let source =
-    {ocaml|let foo x = x
+  test_rename
+    ~newName:"ident"
+    {ocaml|let $foo x = x
 
 let bar ~foo = foo ()
 
 let () = bar ~foo
-|ocaml}
-  in
-  run source (fun client ->
-    let* response =
-      rename ~newName:"ident" client (Position.create ~line:0 ~character:4)
-    in
-    print_workspace_edit response;
-    Fiber.return ());
+|ocaml};
   [%expect
     {|
-    {
-      "changes": {
-        "file:///test.ml": [
-          {
-            "newText": ":ident",
-            "range": {
-              "end": { "character": 17, "line": 4 },
-              "start": { "character": 17, "line": 4 }
-            }
-          },
-          {
-            "newText": "ident",
-            "range": {
-              "end": { "character": 7, "line": 0 },
-              "start": { "character": 4, "line": 0 }
-            }
-          }
-        ]
-      }
-    }
+    let ident x = x
+
+    let bar ~foo = foo ()
+
+    let () = bar ~foo:ident
     |}]
 ;;
 
 let%expect_test "rename a var used as an optional argument" =
-  let source =
-    {ocaml|let foo = Some ()
+  test_rename
+    ~newName:"sunit"
+    {ocaml|let $foo = Some ()
 
 let bar ?foo () = foo
 
 ;;
 ignore (bar ?foo ())
-|ocaml}
-  in
-  run source (fun client ->
-    let* response =
-      rename ~newName:"sunit" client (Position.create ~line:0 ~character:4)
-    in
-    print_workspace_edit response;
-    Fiber.return ());
+|ocaml};
   [%expect
     {|
-    {
-      "changes": {
-        "file:///test.ml": [
-          {
-            "newText": ":sunit",
-            "range": {
-              "end": { "character": 16, "line": 5 },
-              "start": { "character": 16, "line": 5 }
-            }
-          },
-          {
-            "newText": "sunit",
-            "range": {
-              "end": { "character": 7, "line": 0 },
-              "start": { "character": 4, "line": 0 }
-            }
-          }
-        ]
-      }
-    }
+    let sunit = Some ()
+
+    let bar ?foo () = foo
+
+    ;;
+    ignore (bar ?foo:sunit ())
     |}]
 ;;
 
-let setup_multi_file_workspace () =
+let setup_multi_file_workspace
+      ?(files =
+        [ "lib.ml", "let value = 1\n"
+        ; "main.ml", "let result = Lib.value\n"
+        ; "other.ml", "let other = Lib.value\n"
+        ])
+      ()
+  =
   let dir = Test.temp_dir "ocamllsp-rename-" in
   Test.write_file (Filename.concat dir "dune-project") "(lang dune 3.0)\n";
   Test.write_file
     (Filename.concat dir "dune")
     "(library\n (name rename_files)\n (wrapped false))\n";
-  Test.write_file (Filename.concat dir "lib.ml") "let value = 1\n";
-  Test.write_file (Filename.concat dir "main.ml") "let result = Lib.value\n";
-  Test.write_file (Filename.concat dir "other.ml") "let other = Lib.value\n";
+  List.iter files ~f:(fun (name, source) ->
+    Test.write_file (Filename.concat dir name) source);
   Test.run_command ~cwd:dir "dune build @ocaml-index";
   dir
 ;;
@@ -401,6 +362,60 @@ let print_document_changes (edit : WorkspaceEdit.t) =
             failwith "unexpected annotated or snippet edit")
       | `CreateFile _ | `RenameFile _ | `DeleteFile _ ->
         failwith "unexpected resource operation")
+;;
+
+let test_project_rename ~newName ~request_file files =
+  let request_source, { Range.start = position; end_ } =
+    List.Assoc.find_exn files request_file ~equal:String.equal
+    |> Code_actions.parse_selection
+  in
+  assert (Position.compare position end_ = 0);
+  let files =
+    List.map files ~f:(fun (name, source) ->
+      if String.equal name request_file then name, request_source else name, source)
+  in
+  let dir = setup_multi_file_workspace ~files () in
+  let uri name = Filename.concat dir name |> DocumentUri.of_path in
+  let request_uri = uri request_file in
+  let workspace = WorkspaceFolder.create ~uri:(DocumentUri.of_path dir) ~name:"rename" in
+  let stderr = Unix.openfile Test.null_device [ O_WRONLY ] 0 in
+  let handler = Client.Handler.make ~on_notification:(fun _ _ -> Fiber.return ()) () in
+  (Test.run_initialized
+     ~cwd:dir
+     ~stderr
+     ~handler
+     ~capabilities:(capabilities ~documentChanges:true)
+     ~workspaceFolders:(Some [ workspace ])
+   @@ fun client ->
+   let* () =
+     open_project_document client ~uri:request_uri ~version:0 ~text:request_source
+   in
+   let textDocument = TextDocumentIdentifier.create ~uri:request_uri in
+   let* response =
+     Client.request
+       client
+       (TextDocumentRename (RenameParams.create ~textDocument ~position ~newName ()))
+   in
+   let document_changes =
+     (Option.value_exn response).documentChanges |> Option.value_exn
+   in
+   List.iter document_changes ~f:(function
+     | `TextDocumentEdit { textDocument = { uri; version = _ }; edits } ->
+       let name = DocumentUri.to_path uri |> Filename.basename in
+       let source = List.Assoc.find_exn files name ~equal:String.equal in
+       let edits =
+         List.map edits ~f:(function
+           | `TextEdit edit -> edit
+           | `AnnotatedTextEdit _ | `SnippetTextEdit _ ->
+             failwith "unexpected annotated or snippet edit")
+       in
+       Printf.printf "%s:\n" name;
+       Test.apply_edits source edits |> print_string
+     | `CreateFile _ | `RenameFile _ | `DeleteFile _ ->
+       failwith "unexpected resource operation");
+   let* () = Client.request client Shutdown in
+   Client.stop client);
+  Unix.close stderr
 ;;
 
 let%expect_test "rename a symbol across open and closed files" =
@@ -439,13 +454,13 @@ let%expect_test "rename a symbol across open and closed files" =
              ~newName:"renamed"
              ()))
    in
-   print_document_changes response;
+   print_document_changes (Option.value_exn response);
    let* () = Client.request client Shutdown in
    Client.stop client);
   Unix.close stderr;
   [%expect
     {|
-    lib.ml (version 7)
+    lib.ml (version null)
     {
       "newText": "renamed",
       "range": {
@@ -469,5 +484,140 @@ let%expect_test "rename a symbol across open and closed files" =
         "start": { "character": 16, "line": 0 }
       }
     }
+    |}]
+;;
+
+let%expect_test "rename cross-file record-punned variable also renames field" =
+  test_project_rename
+    ~newName:"renamed"
+    ~request_file:"lib.ml"
+    [ ( "lib.ml"
+      , {ocaml|type t = { value : int }
+let $value = 1
+|ocaml}
+      )
+    ; ( "main.ml"
+      , {ocaml|open Lib
+let result : t = { value }
+|ocaml}
+      )
+    ];
+  [%expect
+    {|
+    lib.ml:
+    type t = { value : int }
+    let renamed = 1
+    main.ml:
+    open Lib
+    let result : t = { renamed }
+    |}]
+;;
+
+let%expect_test "rename cross-file punned record field also renames variable" =
+  test_project_rename
+    ~newName:"renamed"
+    ~request_file:"lib.ml"
+    [ ( "lib.ml"
+      , {ocaml|type t = { $value : int }
+let value = 1
+|ocaml}
+      )
+    ; ( "main.ml"
+      , {ocaml|open Lib
+let result : t = { value }
+|ocaml}
+      )
+    ];
+  [%expect
+    {|
+    lib.ml:
+    type t = { renamed : int }
+    let value = 1
+    main.ml:
+    open Lib
+    let result : t = { renamed }
+    |}]
+;;
+
+let%expect_test "rename field without local declaration also renames punned variable" =
+  test_project_rename
+    ~newName:"renamed"
+    ~request_file:"main.ml"
+    [ "lib.ml", "type t = { value : int }\n"
+    ; ( "main.ml"
+      , {ocaml|open Lib
+let value = 1
+let explicit : t = { $value = 2 }
+let punned : t = { value }
+|ocaml}
+      )
+    ];
+  [%expect
+    {|
+    lib.ml:
+    type t = { renamed : int }
+    main.ml:
+    open Lib
+    let value = 1
+    let explicit : t = { renamed = 2 }
+    let punned : t = { renamed }
+    |}]
+;;
+
+let%expect_test "rename qualified record-punned variable also renames field" =
+  test_rename
+    ~newName:"y"
+    {ocaml|module M = struct type t = { x : int } end
+let f $x : M.t = { M.x }
+|ocaml};
+  [%expect
+    {|
+    module M = struct type t = { x : int } end
+    let f y : M.t = { y }
+    |}]
+;;
+
+let%expect_test "rename qualified punned field also renames variable" =
+  test_rename
+    ~newName:"y"
+    {ocaml|module M = struct type t = { $x : int } end
+let x = 1
+let value : M.t = { M.x }
+|ocaml};
+  [%expect
+    {|
+    module M = struct type t = { y : int } end
+    let x = 1
+    let value : M.t = { M.y }
+    |}]
+;;
+
+let%expect_test "equal ranges in different files are not record puns" =
+  test_project_rename
+    ~newName:"renamed"
+    ~request_file:"lib.ml"
+    [ ( "lib.ml"
+      , {ocaml|type t = { value : int }
+let $value = 1
+let f value : t = { value }
+|ocaml}
+      )
+    ; ( "main.ml"
+      , {ocaml|let zero = 0
+let one = 1
+let result =    Lib.value
+|ocaml}
+      )
+    ];
+  [%expect
+    {|
+    lib.ml:
+    type t = { value : int }
+    let renamed = 1
+    let f value : t = { value }
+    main.ml:
+    let zero = 0
+    let one = 1
+    let result =    Lib.renamed
     |}]
 ;;

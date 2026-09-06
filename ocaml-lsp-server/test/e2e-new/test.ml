@@ -35,6 +35,7 @@ module Import = struct
   module Bin = Ocaml_lsp_server.Testing.Bin
   module Client = Lsp_fiber.Client
   include Lsp.Types
+  module Range = Lsp.Range
   module Uri = Lsp.Uri
   module Position = Ocaml_lsp_server.Position
 end
@@ -193,7 +194,9 @@ end = struct
            in
            server_exit_status)
     in
-    Lev_fiber.run (fun () ->
+    (* Report writes to an exited server as [EPIPE] instead of letting SIGPIPE
+       terminate the entire inline-test partition without a useful backtrace. *)
+    Lev_fiber.run ~sigpipe:`Ignore (fun () ->
       let* wheel = Lev_fiber.Timer.Wheel.create ~delay:timeout in
       let+ res = init
       and+ status =
@@ -314,6 +317,59 @@ let open_document ?(language_id = "ocaml") ~client ~uri ~source () =
     (TextDocumentDidOpen (DidOpenTextDocumentParams.create ~textDocument))
 ;;
 
+let position_of_offset src target =
+  assert (0 <= target && target <= String.length src);
+  let rec loop offset line character =
+    if offset = target
+    then Position.create ~line ~character
+    else (
+      let decoded = Stdlib.String.get_utf_8_uchar src offset in
+      assert (Stdlib.Uchar.utf_decode_is_valid decoded);
+      let uchar = Stdlib.Uchar.utf_decode_uchar decoded in
+      let byte_length = Stdlib.Uchar.utf_decode_length decoded in
+      assert (offset + byte_length <= target);
+      if Stdlib.Uchar.equal uchar (Stdlib.Uchar.of_char '\n')
+      then loop (offset + byte_length) (line + 1) 0
+      else
+        loop
+          (offset + byte_length)
+          line
+          (character + (Stdlib.Uchar.utf_16_byte_length uchar / 2)))
+  in
+  loop 0 0 0
+;;
+
+let parse_selection src =
+  let start_pos =
+    match String.index src '$' with
+    | Some x -> x
+    | None -> failwith "expected a selection opening mark"
+  in
+  let end_pos =
+    match String.index_from src (start_pos + 1) '$' with
+    | Some x ->
+      if Option.is_some (String.index_from src (x + 1) '$')
+      then failwith "unexpected third selection mark";
+      x - 1 (* account for opening mark *)
+    | None -> start_pos
+  in
+  let src' =
+    String.filter_map src ~f:(function
+      | '$' -> None
+      | c -> Some c)
+  in
+  let start = position_of_offset src' start_pos in
+  let end_ = position_of_offset src' end_pos in
+  src', Range.create ~start ~end_
+;;
+
+let parse_cursor source_with_cursor =
+  let source, { Range.start = position; end_ } = parse_selection source_with_cursor in
+  if Position.compare position end_ <> 0
+  then failwith "expected a cursor marker, not a selection";
+  source, position
+;;
+
 let offset_of_position src (pos : Position.t) =
   let line_offset =
     String.split_lines src
@@ -349,6 +405,25 @@ let apply_edits src edits =
   (* apply edits *)
   List.fold_left edits ~init:src ~f:(fun src (new_text, start, end_) ->
     String.prefix src start ^ new_text ^ String.drop_prefix src end_)
+;;
+
+let apply_workspace_edit source (edit : WorkspaceEdit.t) =
+  let text_edits =
+    match edit.changes, edit.documentChanges with
+    | Some [ (_, edits) ], None -> edits
+    | None, Some [ `TextDocumentEdit { edits; _ } ] ->
+      List.map edits ~f:(function
+        | `TextEdit edit -> edit
+        | `AnnotatedTextEdit (edit : AnnotatedTextEdit.t) ->
+          TextEdit.create ~newText:edit.newText ~range:edit.range
+        | `SnippetTextEdit (edit : SnippetTextEdit.t) ->
+          TextEdit.create ~newText:edit.snippet.value ~range:edit.range)
+    | Some _, Some _ -> failwith "workspace edit contains both edit representations"
+    | Some _, None | None, Some _ ->
+      failwith "expected workspace edits for exactly one document"
+    | None, None -> failwith "workspace edit contains no edits"
+  in
+  apply_edits source text_edits
 ;;
 
 let print_result result =
