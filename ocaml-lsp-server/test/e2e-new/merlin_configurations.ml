@@ -69,9 +69,12 @@ let code_action_capabilities () =
 
 let rename client ~position ~newName =
   let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
-  Client.request
-    client
-    (TextDocumentRename (RenameParams.create ~textDocument ~position ~newName ()))
+  let+ result =
+    Client.request
+      client
+      (TextDocumentRename (RenameParams.create ~textDocument ~position ~newName ()))
+  in
+  Option.value_exn result
 ;;
 
 let print_request_error request =
@@ -553,15 +556,17 @@ let%expect_test "definition unions mode-specific targets" =
               ~position:(Position.create ~line:2 ~character:10)
               ()))
     in
+    let print_location { Location.uri; range = { Range.start; _ } } =
+      Printf.printf
+        "%s:%d:%d\n"
+        (DocumentUri.to_path uri |> Filename.basename)
+        start.line
+        start.character
+    in
     match response with
     | None -> print_endline "none"
-    | Some (`Location locations) ->
-      List.iter locations ~f:(fun { Location.uri; range = { Range.start; _ } } ->
-        Printf.printf
-          "%s:%d:%d\n"
-          (DocumentUri.to_path uri |> Filename.basename)
-          start.line
-          start.character)
+    | Some (`SingleLocation location) -> print_location location
+    | Some (`Location locations) -> List.iter locations ~f:print_location
     | Some (`LocationLink links) ->
       List.iter
         links

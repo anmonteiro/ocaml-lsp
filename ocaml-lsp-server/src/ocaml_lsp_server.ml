@@ -681,7 +681,7 @@ let references
     let* declarations =
       if context.includeDeclaration
       then Fiber.return []
-      else (
+      else
         let* configured =
           Document.Merlin.dispatch_all
             ~name:"reference-declaration"
@@ -738,7 +738,7 @@ let references
             |> Option.value ~default:(List.hd_exn failures)
           in
           Exn_with_backtrace.reraise error);
-        Fiber.return declarations)
+        Fiber.return declarations
     in
     let+ () =
       match out_of_sync with
