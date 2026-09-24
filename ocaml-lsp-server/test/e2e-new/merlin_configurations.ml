@@ -371,6 +371,58 @@ let%expect_test "completion intersects modes and honors comment suppression" =
     |}]
 ;;
 
+let%expect_test "completion intersects whole-call snippets across modes" =
+  let source =
+    "type t = Shared of int\n\
+     let shared_call ~a ~b = a + b\n\
+     let MODE_NAME ~a ~b = a + b\n\
+     let divergent ~a ~b = MODE_LAMBDA________________\n\
+     let _ = "
+  in
+  let capabilities =
+    let resolveSupport =
+      ClientCompletionItemResolveOptions.create ~properties:[ "documentation" ]
+    in
+    let completionItem =
+      ClientCompletionItemOptions.create ~snippetSupport:true ~resolveSupport ()
+    in
+    let completion = CompletionClientCapabilities.create ~completionItem () in
+    let textDocument = TextDocumentClientCapabilities.create ~completion () in
+    ClientCapabilities.create ~textDocument ()
+  in
+  Helpers.test ~capabilities ~extra_env:(extra_env "preprocessed") source (fun client ->
+    let+ response =
+      Completion.request_completions client (Position.create ~line:4 ~character:8)
+    in
+    let items = completion_items response in
+    List.iter
+      [ "shared_call (call)"
+      ; "Shared (call)"
+      ; "ocamlOnly (call)"
+      ; "melanOnly (call)"
+      ; "divergent"
+      ; "divergent (call)"
+      ]
+      ~f:(fun label -> Printf.printf "%s: %b\n" label (has_completion items label));
+    let call =
+      List.find_exn items ~f:(fun (item : CompletionItem.t) ->
+        String.equal item.label "shared_call (call)")
+    in
+    Printf.printf "snippet: %b\n" (call.insertTextFormat = Some InsertTextFormat.Snippet);
+    Printf.printf "resolve data: %b\n" (Option.is_some call.data));
+  [%expect
+    {|
+    shared_call (call): true
+    Shared (call): true
+    ocamlOnly (call): false
+    melanOnly (call): false
+    divergent: true
+    divergent (call): false
+    snippet: true
+    resolve data: false
+    |}]
+;;
+
 let%expect_test "completion uses the declared default as its primary configuration" =
   let source = "let value = MODE_EXPR\nlet _ = val" in
   Helpers.test ~extra_env:(extra_env "reversed-preprocessed") source (fun client ->
@@ -853,11 +905,11 @@ let%expect_test "cancellation discards a partial multi-mode hover" =
   let extra_env = ("FAKE_OCAML_MERLIN_PP_LOG=" ^ log) :: extra_env "slow-preprocessed" in
   let on_notification, _ = Test.drain_diagnostics () in
   let handler = Client.Handler.make ~on_notification () in
-  Test.run_initialized ~handler ~extra_env (fun client ->
+  Test.run_initialized ~handler ~extra_env ~timeout:15.0 (fun client ->
     let source = "let value = MODE_EXPR\nlet _ = value" in
-    let* () = Test.open_document ~client ~uri:Helpers.uri ~source () in
     let settings = `Assoc [ "diagnostics_delay", `Float 10.0 ] in
     let* () = Client.notification client (ChangeConfiguration { settings }) in
+    let* () = Test.open_document ~client ~uri:Helpers.uri ~source () in
     let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
     let params =
       HoverParams.create
@@ -886,7 +938,7 @@ let%expect_test "missing counterpart creation requires mode consensus" =
     let path = Filename.concat dir "main.ml" in
     Test.write_file path source;
     let uri = DocumentUri.of_path path in
-    let on_notification, _ = Test.drain_diagnostics () in
+    let on_notification, diagnostics = Test.drain_diagnostics () in
     let handler = Client.Handler.make ~on_notification () in
     Test.run_initialized ~cwd:dir ~handler ~extra_env:(extra_env ~root:dir protocol)
     @@ fun client ->
@@ -911,6 +963,7 @@ let%expect_test "missing counterpart creation requires mode consensus" =
       (match basenames with
        | [] -> "<none>"
        | basenames -> String.concat basenames ~sep:", ");
+    let* () = Fiber.Ivar.read diagnostics in
     Test.shutdown_client client
   in
   run "plural";
@@ -928,7 +981,7 @@ let%expect_test "exact counterparts are unioned by mode" =
   List.iter [ "main.ml"; "main.ocaml.mli"; "main.melange.mli" ] ~f:(fun name ->
     Test.write_file (path name) "let value = 1\n");
   let uri = DocumentUri.of_path (path "main.ml") in
-  let on_notification, _ = Test.drain_diagnostics () in
+  let on_notification, diagnostics = Test.drain_diagnostics () in
   let handler = Client.Handler.make ~on_notification () in
   (Test.run_initialized ~cwd:dir ~handler ~extra_env:(extra_env ~root:dir "counterparts")
    @@ fun client ->
@@ -948,6 +1001,7 @@ let%expect_test "exact counterparts are unioned by mode" =
        |> Filename.basename)
    in
    List.iter basenames ~f:print_endline;
+   let* () = Fiber.Ivar.read diagnostics in
    Test.shutdown_client client);
   [%expect
     {|
@@ -965,7 +1019,7 @@ let%expect_test "legacy counterpart lookup starts from the symlink target" =
   Test.write_file interface "val value : int\n";
   Unix.symlink original link;
   let uri = DocumentUri.of_path link in
-  let on_notification, _ = Test.drain_diagnostics () in
+  let on_notification, diagnostics = Test.drain_diagnostics () in
   let handler = Client.Handler.make ~on_notification () in
   (Test.run_initialized ~handler ~extra_env:(extra_env ~root:dir "legacy")
    @@ fun client ->
@@ -986,6 +1040,7 @@ let%expect_test "legacy counterpart lookup starts from the symlink target" =
    Printf.printf
      "original interface: %b\n"
      (String.equal counterpart (Unix.realpath interface));
+   let* () = Fiber.Ivar.read diagnostics in
    Test.exit_client client);
   [%expect {| original interface: true |}]
 ;;
