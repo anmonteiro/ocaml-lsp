@@ -1250,27 +1250,9 @@ let compute_tokens doc =
       ~configurations
       (fun _ pipeline -> compute_tokens_in_pipeline pipeline)
   in
-  let results = Merlin_dot_protocol.Nonempty_list.to_list results in
-  let errors, tokens =
-    List.fold_left results ~init:([], []) ~f:(fun (errors, tokens) result ->
-      let { Document.Merlin.configuration; result } = result in
-      match result with
-      | Ok result -> errors, result :: tokens
-      | Error error -> (configuration, error) :: errors, tokens)
-  in
-  match errors with
-  | [] -> Tokens.intersection (List.rev tokens)
-  | errors ->
-    let modes =
-      List.rev_map errors ~f:(fun (configuration, _) ->
-        Merlin_config.configuration_label configuration)
-      |> String.concat ~sep:", "
-    in
-    Jsonrpc.Response.Error.raise
-      (Jsonrpc.Response.Error.make
-         ~code:RequestFailed
-         ~message:(sprintf "Semantic tokens failed for modes: %s" modes)
-         ())
+  match Document.Merlin.all_results ~name:"Semantic tokens" results with
+  | Ok tokens -> List.map tokens ~f:snd |> Tokens.intersection
+  | Error error -> Jsonrpc.Response.Error.raise error
 ;;
 
 let compute_encoded_tokens config doc =

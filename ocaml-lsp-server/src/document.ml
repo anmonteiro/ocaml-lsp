@@ -323,6 +323,52 @@ module Merlin = struct
     ; result : ('a, Exn_with_backtrace.t) result
     }
 
+  let partition_results ~name results =
+    Merlin_dot_protocol.Nonempty_list.to_list results
+    |> List.partition_map ~f:(fun { configuration; result } ->
+      match result with
+      | Ok value -> Either.First (configuration, value)
+      | Error error ->
+        (match error.exn with
+         | Jsonrpc.Response.Error.E { code = RequestCancelled; _ } ->
+           Exn_with_backtrace.reraise error
+         | _ -> ());
+        Log.log ~section:"merlin" (fun () ->
+          Log.msg
+            ("Merlin configuration failed while computing " ^ name)
+            [ "mode", `String (Merlin_config.configuration_label configuration)
+            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
+            ]);
+        Either.Second (configuration, error))
+  ;;
+
+  let successful_results ~name results =
+    match partition_results ~name results with
+    | (_ :: _ as values), _ -> values
+    | [], errors ->
+      let _, error =
+        List.find errors ~f:(fun (configuration, _) -> configuration.is_default)
+        |> Option.value ~default:(List.hd_exn errors)
+      in
+      Exn_with_backtrace.reraise error
+  ;;
+
+  let all_results ~name results =
+    match partition_results ~name results with
+    | values, [] -> Ok values
+    | _, errors ->
+      let modes =
+        List.map errors ~f:(fun (configuration, _) ->
+          Merlin_config.configuration_label configuration)
+        |> String.concat ~sep:", "
+      in
+      Error
+        (Jsonrpc.Response.Error.make
+           ~code:RequestFailed
+           ~message:(sprintf "%s failed for modes: %s" name modes)
+           ())
+  ;;
+
   let to_doc t = Merlin t
   let source t = Msource.make (text (Merlin t))
   let timer (t : t) = t.timer

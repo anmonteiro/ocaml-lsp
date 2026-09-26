@@ -452,40 +452,12 @@ let text_document_lens
           in
           info :: children
       in
-      let lenses, failures, successes =
-        Merlin_dot_protocol.Nonempty_list.to_list configured
-        |> List.fold_left
-             ~init:([], [], 0)
-             ~f:
-               (fun
-                 (lenses, failures, successes)
-                 ({ configuration; result } : _ Document.Merlin.configured_result)
-               ->
-               match result with
-               | Error error -> lenses, (configuration, error) :: failures, successes
-               | Ok outline ->
-                 let found = List.concat_map ~f:symbol_info_of_outline_item outline in
-                 ( List.rev_append
-                     (List.map found ~f:(fun lens -> configuration, lens))
-                     lenses
-                 , failures
-                 , successes + 1 ))
+      let lenses =
+        Document.Merlin.successful_results ~name:"code lens" configured
+        |> List.concat_map ~f:(fun (configuration, outline) ->
+          List.concat_map ~f:symbol_info_of_outline_item outline
+          |> List.map ~f:(fun lens -> configuration, lens))
       in
-      List.iter failures ~f:(fun (configuration, error) ->
-        Log.log ~section:"merlin" (fun () ->
-          Log.msg
-            "Merlin code lens configuration failed"
-            [ "mode", `String (Merlin_config.configuration_label configuration)
-            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-            ]));
-      if successes = 0
-      then (
-        let primary = Merlin_config.primary configurations in
-        match
-          List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-        with
-        | Some (_, error) -> Exn_with_backtrace.reraise error
-        | None -> invalid_arg "configured code lens query had no result");
       let rec add_lens configuration lens = function
         | [] -> [ lens, [ configuration ] ]
         | (candidate, contributors) :: rest ->
@@ -502,7 +474,7 @@ let text_document_lens
           else (candidate, contributors) :: add_lens configuration lens rest
       in
       let groups =
-        List.fold_left (List.rev lenses) ~init:[] ~f:(fun groups (configuration, lens) ->
+        List.fold_left lenses ~init:[] ~f:(fun groups (configuration, lens) ->
           add_lens configuration lens groups)
       in
       let all_configurations = Merlin_config.configuration_list configurations in
@@ -564,37 +536,10 @@ let selection_range
                pipeline
                (Enclosing (Position.logical position, None))))
     in
-    let failures =
-      Merlin_dot_protocol.Nonempty_list.to_list configured
-      |> List.filter_map
-           ~f:(fun ({ configuration; result } : _ Document.Merlin.configured_result) ->
-             Result.error result |> Option.map ~f:(fun error -> configuration, error))
-    in
-    if not (List.is_empty failures)
-    then (
-      List.iter failures ~f:(fun (configuration, error) ->
-        Log.log ~section:"merlin" (fun () ->
-          Log.msg
-            "Merlin selection range configuration failed"
-            [ "mode", `String (Merlin_config.configuration_label configuration)
-            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-            ]));
-      let modes =
-        List.map failures ~f:(fun (configuration, _) ->
-          Merlin_config.configuration_label configuration)
-        |> String.concat ~sep:", "
-      in
-      Jsonrpc.Response.Error.raise
-        (Jsonrpc.Response.Error.make
-           ~code:RequestFailed
-           ~message:("Selection range failed for configurations: " ^ modes)
-           ()));
     let all_enclosings =
-      Merlin_dot_protocol.Nonempty_list.to_list configured
-      |> List.map ~f:(fun ({ result; _ } : _ Document.Merlin.configured_result) ->
-        match result with
-        | Ok value -> value
-        | Error _ -> invalid_arg "failed selection range survived validation")
+      match Document.Merlin.all_results ~name:"Selection range" configured with
+      | Ok values -> List.map values ~f:snd
+      | Error error -> Jsonrpc.Response.Error.raise error
     in
     List.mapi positions ~f:(fun index position ->
       let chains =
@@ -629,56 +574,33 @@ let references
         ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Project))
     in
-    let locations, out_of_sync, failures, successes =
-      Merlin_dot_protocol.Nonempty_list.to_list configured
+    let locations, out_of_sync =
+      Document.Merlin.successful_results ~name:"references" configured
       |> List.fold_left
-           ~init:([], [], [], 0)
-           ~f:
-             (fun
-               (locations, out_of_sync, failures, successes)
-               ({ configuration; result } : _ Document.Merlin.configured_result)
-             ->
-             match result with
-             | Error error ->
-               locations, out_of_sync, (configuration, error) :: failures, successes
-             | Ok (occurrences, synced) ->
-               let out_of_sync =
-                 match synced with
-                 | `Out_of_sync _ -> configuration :: out_of_sync
-                 | _ -> out_of_sync
-               in
-               let found =
-                 List.filter_map
-                   occurrences
-                   ~f:(fun ({ loc; is_stale } : Query_protocol.occurrence) ->
-                     if is_stale
-                     then None
-                     else (
-                       let range = Range.of_loc loc in
-                       let target_uri =
-                         match loc.loc_start.pos_fname with
-                         | "" -> uri
-                         | path -> Source_path.of_path path
-                       in
-                       Some (Source_path.location { Location.uri = target_uri; range })))
-               in
-               List.rev_append found locations, out_of_sync, failures, successes + 1)
+           ~init:([], [])
+           ~f:(fun (locations, out_of_sync) (configuration, (occurrences, synced)) ->
+             let out_of_sync =
+               match synced with
+               | `Out_of_sync _ -> configuration :: out_of_sync
+               | _ -> out_of_sync
+             in
+             let found =
+               List.filter_map
+                 occurrences
+                 ~f:(fun ({ loc; is_stale } : Query_protocol.occurrence) ->
+                   if is_stale
+                   then None
+                   else (
+                     let range = Range.of_loc loc in
+                     let target_uri =
+                       match loc.loc_start.pos_fname with
+                       | "" -> uri
+                       | path -> Source_path.of_path path
+                     in
+                     Some (Source_path.location { Location.uri = target_uri; range })))
+             in
+             List.rev_append found locations, out_of_sync)
     in
-    List.iter failures ~f:(fun (configuration, error) ->
-      Log.log ~section:"merlin" (fun () ->
-        Log.msg
-          "Merlin occurrences configuration failed"
-          [ "mode", `String (Merlin_config.configuration_label configuration)
-          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-          ]));
-    if successes = 0
-    then (
-      let primary = Merlin_config.primary configurations in
-      let _, error =
-        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-        |> Option.value ~default:(List.hd_exn failures)
-      in
-      Exn_with_backtrace.reraise error);
     let* declarations =
       if context.includeDeclaration
       then Fiber.return []
@@ -690,55 +612,27 @@ let references
             ~configurations
             (Locate (None, `ML, Position.logical position))
         in
-        let declarations, failures, successes =
-          Merlin_dot_protocol.Nonempty_list.to_list configured
-          |> List.fold_left
-               ~init:([], [], 0)
-               ~f:
-                 (fun
-                   (declarations, failures, successes)
-                   ({ configuration; result } : _ Document.Merlin.configured_result)
-                 ->
-                 match result with
-                 | Error error ->
-                   declarations, (configuration, error) :: failures, successes
-                 | Ok result ->
-                   let declaration =
-                     match result with
-                     | `At_origin -> Some (`At_origin (Source_path.uri uri, position))
-                     | `Found (path, lexical_position) ->
-                       Position.of_lexical_position lexical_position
-                       |> Option.map ~f:(fun position ->
-                         let uri =
-                           Option.value_map
-                             path
-                             ~default:(Source_path.uri uri)
-                             ~f:Source_path.of_path
-                         in
-                         `Found (uri, position))
-                     | `Builtin _
-                     | `File_not_found _
-                     | `Invalid_context
-                     | `Not_found _
-                     | `Not_in_env _ -> None
-                   in
-                   Option.to_list declaration @ declarations, failures, successes + 1)
+        let declarations =
+          Document.Merlin.successful_results ~name:"reference declaration" configured
+          |> List.filter_map ~f:(fun (_, result) ->
+            match result with
+            | `At_origin -> Some (`At_origin (Source_path.uri uri, position))
+            | `Found (path, lexical_position) ->
+              Position.of_lexical_position lexical_position
+              |> Option.map ~f:(fun position ->
+                let uri =
+                  Option.value_map
+                    path
+                    ~default:(Source_path.uri uri)
+                    ~f:Source_path.of_path
+                in
+                `Found (uri, position))
+            | `Builtin _
+            | `File_not_found _
+            | `Invalid_context
+            | `Not_found _
+            | `Not_in_env _ -> None)
         in
-        List.iter failures ~f:(fun (configuration, error) ->
-          Log.log ~section:"merlin" (fun () ->
-            Log.msg
-              "Merlin reference declaration configuration failed"
-              [ "mode", `String (Merlin_config.configuration_label configuration)
-              ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-              ]));
-        if successes = 0
-        then (
-          let primary = Merlin_config.primary configurations in
-          let _, error =
-            List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-            |> Option.value ~default:(List.hd_exn failures)
-          in
-          Exn_with_backtrace.reraise error);
         Fiber.return declarations
     in
     let+ () =
@@ -791,49 +685,15 @@ let highlight
         ~configurations
         (Occurrences (`Ident_at (Position.logical position), `Buffer))
     in
-    let lsp_locs, failures, successes =
-      Merlin_dot_protocol.Nonempty_list.to_list configured
-      |> List.fold_left
-           ~init:([], [], 0)
-           ~f:
-             (fun
-               (locations, failures, successes)
-               ({ configuration; result } : _ Document.Merlin.configured_result)
-             ->
-             match result with
-             | Error error -> locations, (configuration, error) :: failures, successes
-             | Ok (occurrences, _synced) ->
-               let found =
-                 List.filter_map
-                   occurrences
-                   ~f:(fun (occurrence : Query_protocol.occurrence) ->
-                     let range = Range.of_loc occurrence.loc in
-                     if Lsp.Range.is_single_line range
-                     then
-                       Some
-                         (DocumentHighlight.create
-                            ~range
-                            ~kind:DocumentHighlightKind.Text
-                            ())
-                     else None)
-               in
-               List.rev_append found locations, failures, successes + 1)
+    let lsp_locs =
+      Document.Merlin.successful_results ~name:"highlight" configured
+      |> List.concat_map ~f:(fun (_, (occurrences, _synced)) ->
+        List.filter_map occurrences ~f:(fun (occurrence : Query_protocol.occurrence) ->
+          let range = Range.of_loc occurrence.loc in
+          if Lsp.Range.is_single_line range
+          then Some (DocumentHighlight.create ~range ~kind:DocumentHighlightKind.Text ())
+          else None))
     in
-    List.iter failures ~f:(fun (configuration, error) ->
-      Log.log ~section:"merlin" (fun () ->
-        Log.msg
-          "Merlin highlight configuration failed"
-          [ "mode", `String (Merlin_config.configuration_label configuration)
-          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-          ]));
-    if successes = 0
-    then (
-      let primary = Merlin_config.primary configurations in
-      let _, error =
-        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-        |> Option.value ~default:(List.hd_exn failures)
-      in
-      Exn_with_backtrace.reraise error);
     Some (List.dedup_and_sort ~compare:Poly.compare lsp_locs)
 ;;
 

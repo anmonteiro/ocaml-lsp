@@ -76,6 +76,18 @@ module Merlin : sig
     ; result : ('a, Exn_with_backtrace.t) result
     }
 
+  (** Log failed configurations. If all failed, raise the primary error. *)
+  val successful_results
+    :  name:string
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t
+    -> (Merlin_config.configuration * 'a) list
+
+  (** Require every configuration to succeed, logging all failures. *)
+  val all_results
+    :  name:string
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t
+    -> ((Merlin_config.configuration * 'a) list, Jsonrpc.Response.Error.t) result
+
   val source : t -> Msource.t
   val timer : t -> Lev_fiber.Timer.Wheel.task
   val fixed_configuration : t -> Merlin_config.configuration option
