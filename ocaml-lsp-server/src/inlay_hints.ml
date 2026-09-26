@@ -62,39 +62,11 @@ let compute (state : State.t) { InlayHintParams.range; textDocument = { uri }; _
                  position, outline_type label)
                hints)
       in
-      let hints, failures, successes =
-        Merlin_dot_protocol.Nonempty_list.to_list configured
-        |> List.fold_left
-             ~init:([], [], 0)
-             ~f:
-               (fun
-                 (hints, failures, successes)
-                 ({ configuration; result } : _ Document.Merlin.configured_result)
-               ->
-               match result with
-               | Error error -> hints, (configuration, error) :: failures, successes
-               | Ok found ->
-                 ( List.rev_append
-                     (List.map found ~f:(fun hint -> configuration, hint))
-                     hints
-                 , failures
-                 , successes + 1 ))
+      let hints =
+        Document.Merlin.successful_results ~name:"inlay hints" configured
+        |> List.concat_map ~f:(fun (configuration, hints) ->
+          List.map hints ~f:(fun hint -> configuration, hint))
       in
-      List.iter failures ~f:(fun (configuration, error) ->
-        Log.log ~section:"merlin" (fun () ->
-          Log.msg
-            "Merlin inlay hints configuration failed"
-            [ "mode", `String (Merlin_config.configuration_label configuration)
-            ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-            ]));
-      if successes = 0
-      then (
-        let primary = Merlin_config.primary configurations in
-        let _, error =
-          List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-          |> Option.value ~default:(List.hd_exn failures)
-        in
-        Exn_with_backtrace.reraise error);
       let rec add configuration hint = function
         | [] -> [ hint, [ configuration ] ]
         | (candidate, contributors) :: rest ->
@@ -111,7 +83,7 @@ let compute (state : State.t) { InlayHintParams.range; textDocument = { uri }; _
           else (candidate, contributors) :: add configuration hint rest
       in
       let groups =
-        List.fold_left (List.rev hints) ~init:[] ~f:(fun groups (configuration, hint) ->
+        List.fold_left hints ~init:[] ~f:(fun groups (configuration, hint) ->
           add configuration hint groups)
       in
       let all_configurations = Merlin_config.configuration_list configurations in

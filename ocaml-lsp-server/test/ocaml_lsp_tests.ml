@@ -2,6 +2,88 @@ open Lsp.Types
 module Position = Lsp.Position
 module Range = Lsp.Range
 
+let%expect_test "configured query failure policies" =
+  let open Ocaml_lsp_server.Testing in
+  let configured mode ~is_default result =
+    let configuration =
+      { Merlin_config.origin = Plural { mode; kind = Implementation; counterpart = None }
+      ; is_default
+      ; config = Merlin_kernel.Mconfig.initial
+      }
+    in
+    { Merlin.configuration; result }
+  in
+  let ocaml = configured Ocaml ~is_default:true in
+  let melange = configured Melange ~is_default:false in
+  let error code message =
+    Stdune.Exn_with_backtrace.try_with (fun () ->
+      Jsonrpc.Response.Error.raise (Jsonrpc.Response.Error.make ~code ~message ()))
+  in
+  let failed message = error RequestFailed message in
+  let print_values values =
+    List.iter
+      (fun (configuration, value) ->
+         Printf.printf "%s: %s\n" (Merlin_config.configuration_label configuration) value)
+      values
+  in
+  let print_error error =
+    Printf.printf
+      "%s: %s\n"
+      (Jsonrpc.Response.Error.Code.to_string error.Jsonrpc.Response.Error.code)
+      error.message
+  in
+  let run label policy first rest =
+    print_endline label;
+    let results = Merlin_dot_protocol.Nonempty_list.create first rest in
+    match policy results with
+    | values -> print_values values
+    | exception Jsonrpc.Response.Error.E error -> print_error error
+  in
+  let partial = Merlin.successful_results ~name:"hover" in
+  let all results =
+    match Merlin.all_results ~name:"rename" results with
+    | Ok values -> values
+    | Error error -> Jsonrpc.Response.Error.raise error
+  in
+  run "partial success" partial (melange (failed "melange error")) [ ocaml (Ok "int") ];
+  run
+    "all failed, default last"
+    partial
+    (melange (failed "melange error"))
+    [ ocaml (failed "ocaml error") ];
+  run
+    "all failed, no default"
+    partial
+    (melange (failed "first error"))
+    [ configured (Other "future") ~is_default:false (failed "second error") ];
+  run "all succeed" all (ocaml (Ok "first")) [ melange (Ok "second") ];
+  run "one fails" all (ocaml (Ok "first")) [ melange (failed "melange error") ];
+  run "both fail" all (ocaml (failed "ocaml error")) [ melange (failed "melange error") ];
+  let cancelled = melange (error RequestCancelled "cancelled") in
+  run "partial cancellation" partial (ocaml (Ok "int")) [ cancelled ];
+  run "require-all cancellation" all (ocaml (Ok "int")) [ cancelled ];
+  [%expect
+    {|
+    partial success
+    OCaml: int
+    all failed, default last
+    RequestFailed: ocaml error
+    all failed, no default
+    RequestFailed: first error
+    all succeed
+    OCaml: first
+    Melange: second
+    one fails
+    RequestFailed: rename failed for modes: Melange
+    both fail
+    RequestFailed: rename failed for modes: OCaml, Melange
+    partial cancellation
+    RequestCancelled: cancelled
+    require-all cancellation
+    RequestCancelled: cancelled
+  |}]
+;;
+
 let%expect_test "convert an LSP position to a Merlin logical position" =
   let position = Position.create ~line:2 ~character:3 in
   let (`Logical (line, column)) = Ocaml_lsp_server.Testing.Position.logical position in
