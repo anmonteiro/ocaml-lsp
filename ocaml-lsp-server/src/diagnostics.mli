@@ -46,8 +46,12 @@ val tags_of_message
   -> string
   -> DiagnosticTag.t list option
 
-val begin_merlin_generation : t -> Uri.t -> int
-val merlin_diagnostics : t -> Document.Merlin.t -> generation:int -> bool Fiber.t
+module Generation : sig
+  type t
+end
+
+val begin_merlin_generation : t -> Uri.t -> Generation.t
+val merlin_diagnostics : t -> Document.Merlin.t -> generation:Generation.t -> bool Fiber.t
 val set_report_dune_diagnostics : t -> report_dune_diagnostics:bool -> unit Fiber.t
 val set_shorten_merlin_diagnostics : t -> shorten_merlin_diagnostics:bool -> unit Fiber.t
 
