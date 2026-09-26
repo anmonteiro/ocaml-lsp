@@ -692,6 +692,76 @@ let%expect_test "code actions require the same edit in every mode" =
   [%expect {| portable actions: 0 |}]
 ;;
 
+let%expect_test "inline actions require consensus even with resolve support" =
+  let resolveSupport = ClientCodeActionResolveOptions.create ~properties:[ "edit" ] in
+  let capabilities = Code_action_resolve.code_action_capabilities resolveSupport in
+  let run label protocol expression =
+    let source = "let value = " ^ expression ^ "\nlet result = value" in
+    Helpers.test ~capabilities ~extra_env:(extra_env protocol) source (fun client ->
+      let range =
+        Code_actions.range ~start_line:0 ~start_character:4 ~end_line:0 ~end_character:9
+      in
+      let* action =
+        Code_action_resolve.request_inline_action client ~uri:Helpers.uri ~range
+      in
+      Printf.printf
+        "%s: %s\n"
+        label
+        (match action with
+         | None -> "none"
+         | Some { edit = None; _ } -> "deferred"
+         | Some { edit = Some _; _ } -> "eager");
+      match action with
+      | None -> Fiber.return ()
+      | Some action ->
+        let+ resolved = Client.request client (CodeActionResolve action) in
+        Test.apply_workspace_edit source (Option.value_exn resolved.edit)
+        |> Printf.printf "%s\n")
+  in
+  run "divergent" "preprocessed" "MODE_EXPR";
+  run "matching" "preprocessed" "1";
+  run "exclusive" "exclusive-preprocessed" "MODE_EXPR";
+  [%expect
+    {|
+    divergent: deferred
+    let value = MODE_EXPR
+    let result = (1)
+    matching: deferred
+    let value = 1
+    let result = (1)
+    exclusive: deferred
+    let value = MODE_EXPR
+    let result = ("text")
+    |}]
+;;
+
+let%expect_test "deferred inline rejects a file that became shared" =
+  let dir = Test.temp_dir "inline-became-shared" in
+  let marker = Filename.concat dir "shared" in
+  let extra_env =
+    ("FAKE_OCAML_MERLIN_SHARED=" ^ marker) :: extra_env "switching-preprocessed"
+  in
+  let resolveSupport = ClientCodeActionResolveOptions.create ~properties:[ "edit" ] in
+  let capabilities = Code_action_resolve.code_action_capabilities resolveSupport in
+  let source = "let value = MODE_EXPR\nlet result = value" in
+  Helpers.test ~capabilities ~extra_env source (fun client ->
+    let range =
+      Code_actions.range ~start_line:0 ~start_character:4 ~end_line:0 ~end_character:9
+    in
+    let* action =
+      Code_action_resolve.request_inline_action client ~uri:Helpers.uri ~range
+    in
+    let action = Option.value_exn action in
+    Printf.printf "initially deferred: %b\n" (Option.is_none action.edit);
+    Test.write_file marker "";
+    print_request_error (Client.request client (CodeActionResolve action)));
+  [%expect
+    {|
+    initially deferred: true
+    unexpected success
+    |}]
+;;
+
 let%expect_test "code actions filter diagnostic provenance by wire mode key" =
   let source = "let f x =\n  let y = 1 in\n  0" in
   let range =
@@ -930,6 +1000,58 @@ let%expect_test "cancellation discards a partial multi-mode hover" =
      | `Ok _ -> print_endline "unexpected result");
     Test.exit_client client);
   [%expect {| cancelled |}]
+;;
+
+let%expect_test "closing and reopening discards in-flight diagnostics" =
+  let dir = Test.temp_dir "reopen-diagnostics" in
+  let log = Filename.concat dir "preprocess.log" in
+  let gate = Filename.concat dir "release" in
+  Test.write_file log "";
+  let extra_env =
+    [ "FAKE_OCAML_MERLIN_PP_LOG=" ^ log; "FAKE_OCAML_MERLIN_PP_GATE=" ^ gate ]
+    @ extra_env "slow-preprocessed"
+  in
+  let closed = Fiber.Ivar.create () in
+  let fresh = Fiber.Ivar.create () in
+  let reopened = ref false in
+  let stale = ref [] in
+  let handler =
+    Client.Handler.make
+      ~on_notification:(fun _ -> function
+         | PublishDiagnostics { diagnostics; _ } ->
+           if !reopened then stale := diagnostics @ !stale;
+           if List.is_empty diagnostics
+           then (
+             let signal = if !reopened then fresh else closed in
+             let* filled = Fiber.Ivar.peek signal in
+             match filled with
+             | Some () -> Fiber.return ()
+             | None -> Fiber.Ivar.fill signal ())
+           else Fiber.return ()
+         | _ -> Fiber.return ())
+      ()
+  in
+  Test.run_initialized ~handler ~extra_env ~timeout:15.0 (fun client ->
+    let uri = Helpers.uri in
+    let settings = `Assoc [ "diagnostics_delay", `Float 0.0 ] in
+    let* () = Client.notification client (ChangeConfiguration { settings }) in
+    let* () = Test.open_document ~client ~uri ~source:"let old = missing_old" () in
+    let* () = wait_for_preprocess_mode log "melange" in
+    let textDocument = TextDocumentIdentifier.create ~uri in
+    let* () =
+      Client.notification
+        client
+        (TextDocumentDidClose (DidCloseTextDocumentParams.create ~textDocument))
+    in
+    let* () = Fiber.Ivar.read closed in
+    reopened := true;
+    let* () = Test.open_document ~client ~uri ~source:"let fresh = 1" () in
+    let* (_ : Yojson.Safe.t) = request client uri in
+    Test.write_file gate "";
+    let* () = Fiber.Ivar.read fresh in
+    Printf.printf "stale diagnostics: %d\n" (List.length !stale);
+    Test.shutdown_client client);
+  [%expect {| stale diagnostics: 1 |}]
 ;;
 
 let%expect_test "missing counterpart creation requires mode consensus" =
