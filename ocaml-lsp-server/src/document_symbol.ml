@@ -140,40 +140,13 @@ let run (client_capabilities : ClientCapabilities.t) doc uri =
             ~equal:(fun SymbolTag.Deprecated Deprecated -> true))
     in
     let supported_kinds = Capabilities.document_symbol_kind_support client_capabilities in
-    let symbols, failures, successes =
-      Merlin_dot_protocol.Nonempty_list.to_list configured
-      |> List.fold_left
-           ~init:([], [], 0)
-           ~f:
-             (fun
-               (symbols, failures, successes)
-               ({ configuration; result } : _ Document.Merlin.configured_result)
-             ->
-             match result with
-             | Error error -> symbols, (configuration, error) :: failures, successes
-             | Ok outline ->
-               let mode = Merlin_config.configuration_label configuration in
-               ( items_to_symbols ~supports_deprecated_tag ~supported_kinds ~mode outline
-                 :: symbols
-               , failures
-               , successes + 1 ))
+    let symbols =
+      Document.Merlin.successful_results ~name:"document symbols" configured
+      |> List.map ~f:(fun (configuration, outline) ->
+        let mode = Merlin_config.configuration_label configuration in
+        items_to_symbols ~supports_deprecated_tag ~supported_kinds ~mode outline)
+      |> merge_document_symbols
     in
-    List.iter failures ~f:(fun (configuration, error) ->
-      Log.log ~section:"merlin" (fun () ->
-        Log.msg
-          "Merlin document symbols configuration failed"
-          [ "mode", `String (Merlin_config.configuration_label configuration)
-          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-          ]));
-    if successes = 0
-    then (
-      let primary = Merlin_config.primary configurations in
-      let _, error =
-        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-        |> Option.value ~default:(List.hd_exn failures)
-      in
-      Exn_with_backtrace.reraise error);
-    let symbols = merge_document_symbols (List.rev symbols) in
     (match Capabilities.document_symbol_hierarchical_support client_capabilities with
      | true -> Some (`DocumentSymbol symbols)
      | false ->

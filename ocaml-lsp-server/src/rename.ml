@@ -59,30 +59,9 @@ let request_failed message =
 ;;
 
 let configured_values ~operation results =
-  let values, errors =
-    Merlin_dot_protocol.Nonempty_list.to_list results
-    |> List.fold_left ~init:([], []) ~f:(fun (values, errors) result ->
-      let { Document.Merlin.configuration; result } = result in
-      match result with
-      | Ok value -> (configuration, value) :: values, errors
-      | Error error -> values, (configuration, error) :: errors)
-  in
-  match errors with
-  | [] -> List.rev values
-  | errors ->
-    List.iter errors ~f:(fun (configuration, error) ->
-      Log.log ~section:"merlin" (fun () ->
-        Log.msg
-          ("Merlin configuration failed while computing " ^ operation)
-          [ "mode", `String (Merlin_config.configuration_label configuration)
-          ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-          ]));
-    let modes =
-      List.rev_map errors ~f:(fun (configuration, _) ->
-        Merlin_config.configuration_label configuration)
-      |> String.concat ~sep:", "
-    in
-    request_failed (sprintf "%s failed for modes: %s" operation modes)
+  match Document.Merlin.all_results ~name:operation results with
+  | Ok values -> values
+  | Error error -> Jsonrpc.Response.Error.raise error
 ;;
 
 let prepare

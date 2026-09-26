@@ -123,15 +123,6 @@ let group_documentation ~markdown ~configuration_count contributors =
     Some (`MarkupContent { MarkupContent.kind; value })
 ;;
 
-let log_failure configuration error =
-  Log.log ~section:"merlin" (fun () ->
-    Log.msg
-      "Merlin configuration failed while computing signature help"
-      [ "mode", `String (Merlin_config.configuration_label configuration)
-      ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-      ])
-;;
-
 let run (state : State.t) { SignatureHelpParams.textDocument = { uri }; position; _ } =
   let open Fiber.O in
   let doc =
@@ -281,59 +272,45 @@ let run (state : State.t) { SignatureHelpParams.textDocument = { uri }; position
                  ; documentation
                  }))
     in
-    let results = Merlin_dot_protocol.Nonempty_list.to_list results in
-    let successful, groups =
-      List.fold_left results ~init:(0, []) ~f:(fun (successful, groups) result ->
-        let { Document.Merlin.configuration; result } = result in
+    let groups =
+      Document.Merlin.successful_results ~name:"signature help" results
+      |> List.fold_left ~init:[] ~f:(fun groups (configuration, result) ->
         match result with
-        | Error error ->
-          log_failure configuration error;
-          successful, groups
-        | Ok None -> successful + 1, groups
-        | Ok (Some signature) ->
-          successful + 1, add_signature groups configuration signature)
+        | None -> groups
+        | Some signature -> add_signature groups configuration signature)
     in
-    if successful = 0
-    then (
-      match
-        List.find_map results ~f:(fun { Document.Merlin.result; _ } ->
-          Result.error result)
-      with
-      | Some error -> Exn_with_backtrace.reraise error
-      | None -> assert false)
-    else (
-      match groups with
-      | [] -> Fiber.return (SignatureHelp.create ~signatures:[] ())
-      | groups ->
-        let primary = Merlin_config.primary configurations in
-        let active_signature =
-          List.findi groups ~f:(fun _ group ->
-            List.exists group.contributors ~f:(fun (configuration, _) ->
-              configuration == primary))
-          |> Option.value_map ~default:0 ~f:fst
-        in
-        let active_parameter =
-          (List.nth_exn groups active_signature).signature.active_parameter
-        in
-        let signatures =
-          List.map groups ~f:(fun { signature; contributors } ->
-            let documentation =
-              group_documentation ~markdown ~configuration_count contributors
-            in
-            let activeParameter =
-              Option.some_if supports_active_parameter signature.active_parameter
-            in
-            SignatureInformation.create
-              ~label:signature.label
-              ?documentation
-              ?activeParameter
-              ~parameters:signature.parameters
-              ())
-        in
-        Fiber.return
-          (SignatureHelp.create
-             ~signatures
-             ~activeSignature:active_signature
-             ?activeParameter:(Some active_parameter)
-             ()))
+    (match groups with
+     | [] -> Fiber.return (SignatureHelp.create ~signatures:[] ())
+     | groups ->
+       let primary = Merlin_config.primary configurations in
+       let active_signature =
+         List.findi groups ~f:(fun _ group ->
+           List.exists group.contributors ~f:(fun (configuration, _) ->
+             configuration == primary))
+         |> Option.value_map ~default:0 ~f:fst
+       in
+       let active_parameter =
+         (List.nth_exn groups active_signature).signature.active_parameter
+       in
+       let signatures =
+         List.map groups ~f:(fun { signature; contributors } ->
+           let documentation =
+             group_documentation ~markdown ~configuration_count contributors
+           in
+           let activeParameter =
+             Option.some_if supports_active_parameter signature.active_parameter
+           in
+           SignatureInformation.create
+             ~label:signature.label
+             ?documentation
+             ?activeParameter
+             ~parameters:signature.parameters
+             ())
+       in
+       Fiber.return
+         (SignatureHelp.create
+            ~signatures
+            ~activeSignature:active_signature
+            ?activeParameter:(Some active_parameter)
+            ()))
 ;;

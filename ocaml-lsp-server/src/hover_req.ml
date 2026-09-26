@@ -488,15 +488,6 @@ let aggregate_hovers
     Some (Hover.create ~contents:(`MarkupContent { MarkupContent.kind; value }) ?range ())
 ;;
 
-let log_failure configuration error =
-  Log.log ~section:"merlin" (fun () ->
-    Log.msg
-      "Merlin configuration failed while computing hover"
-      [ "mode", `String (Merlin_config.configuration_label configuration)
-      ; "error", `String (Exn_with_backtrace.to_dyn error |> Dyn.to_string)
-      ])
-;;
-
 let handle_document server doc ~uri ~position mode =
   Fiber.of_thunk (fun () ->
     let state : State.t = Server.state server in
@@ -547,33 +538,18 @@ let handle_document server doc ~uri ~position mode =
                   in
                   Some (Ppx { name; code; range })))
       in
-      let results = Merlin_dot_protocol.Nonempty_list.to_list results in
+      let results = Document.Merlin.successful_results ~name:"hover" results in
       let rec format acc = function
         | [] -> Fiber.return (List.rev acc)
-        | ({ configuration; result } : _ Document.Merlin.configured_result) :: rest ->
+        | (configuration, result) :: rest ->
           (match result with
-           | Error error ->
-             log_failure configuration error;
-             format acc rest
-           | Ok None -> format acc rest
-           | Ok (Some raw_hover) ->
+           | None -> format acc rest
+           | Some raw_hover ->
              let* hover = format_raw_hover ~server ~doc ~markdown raw_hover in
              format ((configuration, hover) :: acc) rest)
       in
-      let* hovers = format [] results in
-      (match hovers with
-       | _ :: _ -> Fiber.return (aggregate_hovers ~markdown ~configuration_count hovers)
-       | [] ->
-         (match
-            List.find_map results ~f:(fun { Document.Merlin.result; _ } ->
-              match result with
-              | Ok _ -> None
-              | Error error -> Some error)
-          with
-          | Some error
-            when List.for_all results ~f:(fun { Document.Merlin.result; _ } ->
-                   Result.is_error result) -> Exn_with_backtrace.reraise error
-          | Some _ | None -> Fiber.return None)))
+      let+ hovers = format [] results in
+      aggregate_hovers ~markdown ~configuration_count hovers)
 ;;
 
 let handle server { HoverParams.textDocument = { uri }; position; _ } mode =

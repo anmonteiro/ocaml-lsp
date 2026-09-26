@@ -26,15 +26,6 @@ let location_of_merlin_loc uri : _ -> (Location.t list, string) result = functio
     Ok locations
 ;;
 
-let log_failure configuration message =
-  Log.log ~section:"merlin" (fun () ->
-    Log.msg
-      "Merlin configuration failed"
-      [ "mode", `String (Merlin_config.configuration_label configuration)
-      ; "message", `String message
-      ])
-;;
-
 let run kind (state : State.t) ?prefix uri position =
   let* () = Fiber.return () in
   let doc = Document_store.get state.store uri in
@@ -52,42 +43,22 @@ let run kind (state : State.t) ?prefix uri position =
       Document.Merlin.configuration_context_exn doc
     in
     let+ results = Document.Merlin.dispatch_all ~name doc ~configurations command in
-    let locations, failures, successes =
-      Merlin_dot_protocol.Nonempty_list.to_list results
-      |> List.fold_left
-           ~init:([], [], 0)
-           ~f:
-             (fun
-               (locations, failures, successes)
-               ({ configuration; result } : _ Document.Merlin.configured_result)
-             ->
-             match result with
-             | Error error ->
-               let message = Exn_with_backtrace.to_dyn error |> Dyn.to_string in
-               log_failure configuration message;
-               locations, (configuration, error) :: failures, successes
-             | Ok result ->
-               (match location_of_merlin_loc uri result with
-                | Ok found -> List.rev_append found locations, failures, successes + 1
-                | Error message ->
-                  Log.log ~section:"debug" (fun () ->
-                    Log.msg
-                      "locate failed"
-                      [ "kind", `String name
-                      ; "mode", `String (Merlin_config.configuration_label configuration)
-                      ; "error", `String message
-                      ]);
-                  locations, failures, successes + 1))
+    let locations =
+      Document.Merlin.successful_results ~name results
+      |> List.concat_map ~f:(fun (configuration, result) ->
+        match location_of_merlin_loc uri result with
+        | Ok locations -> locations
+        | Error message ->
+          Log.log ~section:"debug" (fun () ->
+            Log.msg
+              "locate failed"
+              [ "kind", `String name
+              ; "mode", `String (Merlin_config.configuration_label configuration)
+              ; "error", `String message
+              ]);
+          [])
     in
-    if successes = 0
-    then (
-      let primary = Merlin_config.primary configurations in
-      let _, error =
-        List.find failures ~f:(fun (configuration, _) -> configuration == primary)
-        |> Option.value ~default:(List.hd_exn failures)
-      in
-      Exn_with_backtrace.reraise error);
-    Source_path.deduplicate_locations (List.rev locations)
+    Source_path.deduplicate_locations locations
     |> (function
      | [] -> None
      | locations -> Some (`Location locations))
