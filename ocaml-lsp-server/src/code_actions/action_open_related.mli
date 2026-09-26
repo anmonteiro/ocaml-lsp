@@ -10,4 +10,4 @@ val for_uri
   -> ShowDocumentClientCapabilities.t option
   -> Document.t
   -> (Document.Merlin.t * Document.Merlin.configuration_context) option
-  -> CodeAction.t list Fiber.t
+  -> CodeAction.t list
