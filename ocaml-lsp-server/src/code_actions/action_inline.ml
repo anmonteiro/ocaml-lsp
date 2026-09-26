@@ -502,6 +502,17 @@ let resolve (state : State.t) (action : CodeAction.t) =
          | None | Some _ -> content_modified ()
        in
        let merlin = Document.merlin_exn doc in
+       let* { Document.Merlin.configurations; _ } =
+         Document.Merlin.configuration_context_exn merlin
+       in
+       let configuration =
+         match Merlin_config.configuration_list configurations with
+         | [ configuration ] -> configuration
+         | _ -> content_modified ()
+       in
+       let merlin =
+         Document.with_merlin_configuration doc configuration |> Document.merlin_exn
+       in
        Document.Merlin.with_pipeline_exn ~name:"resolve-inline-code-action" merlin
        @@ fun pipeline ->
        inline_task pipeline range |> Option.bind ~f:(code_action_for_task pipeline doc))

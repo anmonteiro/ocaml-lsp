@@ -723,10 +723,8 @@ let%expect_test "inline actions require consensus even with resolve support" =
   run "exclusive" "exclusive-preprocessed" "MODE_EXPR";
   [%expect
     {|
-    divergent: deferred
-    let value = MODE_EXPR
-    let result = (1)
-    matching: deferred
+    divergent: none
+    matching: eager
     let value = 1
     let result = (1)
     exclusive: deferred
@@ -758,7 +756,7 @@ let%expect_test "deferred inline rejects a file that became shared" =
   [%expect
     {|
     initially deferred: true
-    unexpected success
+    ContentModified: The document changed before the code action was resolved
     |}]
 ;;
 

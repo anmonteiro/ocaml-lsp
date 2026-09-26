@@ -34,7 +34,7 @@ let client_can_resolve_edits (state : State.t) =
   | None -> false
 ;;
 
-let compute_ocaml_code_actions (params : CodeActionParams.t) state doc =
+let compute_ocaml_code_actions (params : CodeActionParams.t) state doc ~resolve_edits =
   let destruct_dispatch = Document.merlin_exn doc |> Action_destruct.cached_dispatch in
   let enabled_actions =
     List.filter
@@ -53,10 +53,7 @@ let compute_ocaml_code_actions (params : CodeActionParams.t) state doc =
       ; "add-rec", Action_add_rec.t
       ; "mark-unused", Action_mark_remove_unused.mark
       ; "remove-unused", Action_mark_remove_unused.remove
-      ; ( "inline"
-        , if client_can_resolve_edits state
-          then Action_inline.unresolved
-          else Action_inline.t )
+      ; ("inline", if resolve_edits then Action_inline.unresolved else Action_inline.t)
       ; "extract-local", Action_extract.local
       ; "extract-function", Action_extract.function_
       ]
@@ -223,6 +220,7 @@ let consensus_action actions =
     let actions = List.filter_opt actions in
     match actions with
     | [] -> None
+    | [ action ] -> Some action
     | first :: rest ->
       if
         Option.is_some first.disabled
@@ -243,13 +241,10 @@ let consensus_action actions =
           | diagnostics -> Some diagnostics
         in
         let isPreferred =
-          match actions with
-          | [ action ] -> action.isPreferred
-          | _ ->
-            Option.some_if
-              (List.for_all actions ~f:(fun action ->
-                 Poly.equal action.isPreferred (Some true)))
-              true
+          Option.some_if
+            (List.for_all actions ~f:(fun action ->
+               Poly.equal action.isPreferred (Some true)))
+            true
         in
         Some { first with diagnostics; isPreferred }))
 ;;
@@ -274,6 +269,12 @@ let compute_configured_code_actions
       doc
       ({ Document.Merlin.configurations; _ } : Document.Merlin.configuration_context)
   =
+  let configurations = Merlin_config.configuration_list configurations in
+  let resolve_edits =
+    match configurations with
+    | [ _ ] -> client_can_resolve_edits state
+    | _ -> false
+  in
   let rec loop results = function
     | [] -> Fiber.return (List.rev results)
     | configuration :: rest ->
@@ -281,7 +282,7 @@ let compute_configured_code_actions
       let params = filter_diagnostics configuration params in
       let* result =
         Fiber.collect_errors (fun () ->
-          compute_ocaml_code_actions params state configured_doc)
+          compute_ocaml_code_actions params state configured_doc ~resolve_edits)
       in
       let actions =
         match result with
@@ -299,7 +300,7 @@ let compute_configured_code_actions
       in
       loop ((configuration, actions) :: results) rest
   in
-  let+ configured = loop [] (Merlin_config.configuration_list configurations) in
+  let+ configured = loop [] configurations in
   consensus_actions configured
 ;;
 
@@ -345,15 +346,15 @@ let compute server (params : CodeActionParams.t) =
     in
     (match Document.kind doc with
      | `Other ->
-       let* open_related =
+       let open_related =
          if kind_is_requested Action_open_related.kind
          then Action_open_related.for_uri ~can_create_file capabilities doc None
-         else Fiber.return []
+         else []
        in
        Fiber.return (Reply.now (actions (dune_actions @ open_related @ open_dune)), state)
      | `Merlin merlin ->
        let* configuration_context = Document.Merlin.configuration_context_exn merlin in
-       let* open_related =
+       let open_related =
          if kind_is_requested Action_open_related.kind
          then
            Action_open_related.for_uri
@@ -361,7 +362,7 @@ let compute server (params : CodeActionParams.t) =
              capabilities
              doc
              (Some (merlin, configuration_context))
-         else Fiber.return []
+         else []
        in
        let* merlin_jumps =
          match state.configuration.data.merlin_jump_code_actions with
