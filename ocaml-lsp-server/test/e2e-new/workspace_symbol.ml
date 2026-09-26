@@ -111,6 +111,23 @@ let%expect_test "uses deprecated workspace symbol tags when supported" =
     |}]
 ;;
 
+let%expect_test "deduplicates symbols from duplicate build artifacts" =
+  let workspace_a, _workspace_b = setup_workspaces () in
+  build_project workspace_a;
+  let build_dir = Filename.concat workspace_a.path "_build/default" in
+  let original = Filename.concat build_dir "bin/.main.eobjs/byte/dune__exe__A.cmt" in
+  let duplicate_dir = Filename.concat build_dir "duplicate" in
+  Unix.mkdir duplicate_dir 0o700;
+  let contents = In_channel.with_open_bin original In_channel.input_all in
+  Test.write_file (Filename.concat duplicate_dir "a.cmt") contents;
+  run [ workspace_a ] (fun client ->
+    let* symbols = workspace_symbol client "a_x" in
+    let count = Option.value symbols ~default:[] |> List.length in
+    Printf.printf "a_x symbols: %d\n" count;
+    Fiber.return ());
+  [%expect {| a_x symbols: 1 |}]
+;;
+
 let%expect_test "returns filtered symbols from workspace" =
   let workspace_a, _workspace_b = setup_workspaces () in
   build_project workspace_a;

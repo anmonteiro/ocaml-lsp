@@ -81,7 +81,7 @@ let on_request ~params state =
     let params = JumpParams.t_of_yojson params in
     let uri = params.textDocument.uri in
     let position = params.position in
-    Util.with_merlin state uri ~default:`Null (fun merlin ->
+    Util.with_primary_merlin state uri ~default:`Null (fun merlin ->
       let targets =
         match params.target with
         | None -> JumpParams.targets

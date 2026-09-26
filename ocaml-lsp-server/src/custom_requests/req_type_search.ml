@@ -100,6 +100,6 @@ let on_request ~params state =
       TypeSearchParams.t_of_yojson params
     in
     let uri = text_document.uri in
-    Util.with_merlin state uri ~default:`Null (fun merlin ->
+    Util.with_primary_merlin state uri ~default:`Null (fun merlin ->
       dispatch merlin position limit query with_doc doc_format))
 ;;

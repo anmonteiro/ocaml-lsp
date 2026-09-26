@@ -32,18 +32,23 @@ let available (capabilities : ShowDocumentClientCapabilities.t option) =
   | Some { support = true } -> true
 ;;
 
-let for_uri ~can_create_file (capabilities : ShowDocumentClientCapabilities.t option) doc =
+let for_uri
+      ~can_create_file
+      (capabilities : ShowDocumentClientCapabilities.t option)
+      doc
+      configuration_context
+  =
   let uri = Document.uri doc in
-  let merlin_doc =
-    match Document.kind doc with
-    | `Merlin doc -> Some doc
-    | `Other -> None
-  in
   match available capabilities, Document.syntax doc with
   | false, _ | true, (Dune | Cram) -> []
   | true, (Ocaml | Reason | Ocamllex | Menhir | Mlx) ->
-    Document.get_impl_intf_counterparts merlin_doc uri
-    |> List.filter_map ~f:(fun uri ->
+    let counterparts =
+      match configuration_context with
+      | None -> Document.get_impl_intf_counterparts None uri
+      | Some (merlin, { Document.Merlin.configurations; _ }) ->
+        Document.get_impl_intf_counterparts_for_configurations merlin configurations uri
+    in
+    List.filter_map counterparts ~f:(fun uri ->
       let path = Uri.to_path uri in
       let exists = Sys.file_exists path in
       if (not exists) && not can_create_file
