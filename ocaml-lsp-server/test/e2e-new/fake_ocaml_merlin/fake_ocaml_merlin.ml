@@ -154,6 +154,7 @@ let protocol =
   | Some "reversed-preprocessed" -> `Reversed_preprocessed
   | Some "extended-preprocessed" -> `Extended_preprocessed
   | Some "slow-preprocessed" -> `Slow_preprocessed
+  | Some "switching-preprocessed" -> `Switching_preprocessed
   | Some "three-preprocessed" -> `Three_preprocessed
   | Some "divergent-suffixes" -> `Divergent_suffixes
   | Some "counterparts" -> `Counterparts
@@ -174,6 +175,10 @@ let response_for_path path =
     let mode = Filename.basename path |> Filename.remove_extension in
     configurations [ configuration ~mode ~is_default:true (directives ()) ]
   | `Preprocessed | `Slow_preprocessed -> preprocessed_configurations ()
+  | `Switching_preprocessed ->
+    if Sys.file_exists (Sys.getenv "FAKE_OCAML_MERLIN_SHARED")
+    then preprocessed_configurations ()
+    else configurations [ preprocessed_configuration "ocaml" ~is_default:true ]
   | `Reversed_preprocessed -> reversed_preprocessed_configurations ()
   | `Extended_preprocessed -> extended_preprocessed_configuration ()
   | `Three_preprocessed -> preprocessed_configurations ~include_native:true ()
@@ -259,7 +264,15 @@ let log_preprocess mode =
 
 let preprocess mode path =
   log_preprocess mode;
-  if protocol = `Slow_preprocessed && String.equal mode "melange" then Unix.sleepf 5.0;
+  if protocol = `Slow_preprocessed && String.equal mode "melange"
+  then (
+    match Sys.getenv_opt "FAKE_OCAML_MERLIN_PP_GATE" with
+    | None -> Unix.sleepf 5.0
+    | Some path ->
+      let deadline = Unix.gettimeofday () +. 10.0 in
+      while (not (Sys.file_exists path)) && Unix.gettimeofday () < deadline do
+        Unix.sleepf 0.01
+      done);
   let input = In_channel.with_open_bin path In_channel.input_all in
   if String.equal mode "extended"
   then print_string (input ^ "\nlet =")
