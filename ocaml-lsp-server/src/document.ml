@@ -532,16 +532,6 @@ module Merlin = struct
       Query_commands.dispatch pipeline command)
   ;;
 
-  let doc_comment pipeline pos =
-    let res =
-      let command = Query_protocol.Document (None, pos) in
-      Query_commands.dispatch pipeline command
-    in
-    match res with
-    | `Found s | `Builtin s -> Some s
-    | _ -> None
-  ;;
-
   let syntax_doc pipeline pos =
     let res =
       let command = Query_protocol.Syntax_document pos in
@@ -558,32 +548,6 @@ module Merlin = struct
     ; doc : string option
     ; syntax_doc : Query_protocol.syntax_doc_result option
     }
-
-  let type_enclosing ?name doc pos verbosity ~with_syntax_doc =
-    with_pipeline_exn ?name doc (fun pipeline ->
-      let command = Query_protocol.Type_enclosing (None, pos, Some 0) in
-      let pipeline =
-        match verbosity with
-        | 0 -> pipeline
-        | verbosity ->
-          let source = source doc in
-          let config = Mpipeline.final_config pipeline in
-          let config =
-            { config with query = { config.query with verbosity = Lvl verbosity } }
-          in
-          Mpipeline.make config source
-      in
-      match Query_commands.dispatch pipeline command with
-      | [] | (_, `Index _, _) :: _ -> None
-      | (loc, `String typ, _) :: _ ->
-        let doc = doc_comment pipeline pos in
-        let syntax_doc = if with_syntax_doc then syntax_doc pipeline pos else None in
-        Some { loc; typ; doc; syntax_doc })
-  ;;
-
-  let doc_comment ?name doc pos =
-    with_pipeline_exn ?name doc (fun pipeline -> doc_comment pipeline pos)
-  ;;
 end
 
 let kind = function
