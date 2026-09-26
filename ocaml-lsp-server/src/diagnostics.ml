@@ -125,10 +125,12 @@ let equal_message =
     | Exit -> false
 ;;
 
+module Generation = Import.Id.Make ()
+
 type t =
   { dune : (Dune.t, (Drpc.Diagnostic.Id.t, Uri.t * Diagnostic.t) Hashtbl.t) Hashtbl.t
   ; merlin : (Uri.t, Diagnostic.t list) Hashtbl.t
-  ; merlin_generations : (Uri.t, int) Hashtbl.t
+  ; merlin_generations : (Uri.t, Generation.t) Hashtbl.t
   ; send : PublishDiagnosticsParams.t list -> unit Fiber.t
   ; mutable dirty_uris : (Uri.t, Uri.comparator_witness) Set.t
   ; related_information : bool
@@ -162,10 +164,9 @@ let create
 ;;
 
 let begin_merlin_generation t uri =
-  Hashtbl.update t.merlin_generations uri ~f:(function
-    | None -> 1
-    | Some generation -> generation + 1);
-  Hashtbl.find_exn t.merlin_generations uri
+  let generation = Generation.gen () in
+  Hashtbl.set t.merlin_generations ~key:uri ~data:generation;
+  generation
 ;;
 
 let merlin_generation_is_current t uri generation =

@@ -1049,7 +1049,7 @@ let%expect_test "closing and reopening discards in-flight diagnostics" =
     let* () = Fiber.Ivar.read fresh in
     Printf.printf "stale diagnostics: %d\n" (List.length !stale);
     Test.shutdown_client client);
-  [%expect {| stale diagnostics: 1 |}]
+  [%expect {| stale diagnostics: 0 |}]
 ;;
 
 let%expect_test "missing counterpart creation requires mode consensus" =
