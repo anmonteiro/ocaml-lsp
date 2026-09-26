@@ -165,8 +165,9 @@ let%expect_test "CR: constructor completion after Unicode uses the wrong prefix"
     {|
     Ct$: 0 constructor completions
     Ct$or_typo: 0 constructor completions
-    Ctor$: 1 constructor completions
-    let café : t = let _ = "😀" in CtoCtor
+    Ctor$: 2 constructor completions
+    let café : t = let _ = "😀" in Ctor
+    let café : t = let _ = "😀" in (Ctor ${1:_})$0
     |}]
 ;;
 

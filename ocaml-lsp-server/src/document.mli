@@ -134,13 +134,6 @@ module Merlin : sig
     -> 'a Query_protocol.t
     -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t Fiber.t
 
-  val doc_comment
-    :  ?name:string
-    -> t
-    -> Msource.position
-    -> (* doc string *)
-    string option Fiber.t
-
   val syntax_doc
     :  Mpipeline.t
     -> Msource.position
@@ -152,14 +145,6 @@ module Merlin : sig
     ; doc : string option
     ; syntax_doc : Query_protocol.syntax_doc_result option
     }
-
-  val type_enclosing
-    :  ?name:string
-    -> t
-    -> Msource.position
-    -> (* verbosity *) int
-    -> with_syntax_doc:bool
-    -> type_enclosing option Fiber.t
 
   val kind : t -> Kind.t
   val to_doc : t -> doc
