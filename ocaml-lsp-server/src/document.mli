@@ -66,8 +66,37 @@ module Merlin : sig
   type doc := t
   type t
 
+  type configuration_context =
+    { configurations : Merlin_config.configuration_set
+    ; kind : Kind.t
+    }
+
+  type 'a configured_result =
+    { configuration : Merlin_config.configuration
+    ; result : ('a, Exn_with_backtrace.t) result
+    }
+
+  (** Log failed configurations. If all failed, raise the primary error. *)
+  val successful_results
+    :  name:string
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t
+    -> (Merlin_config.configuration * 'a) list
+
+  (** Require every configuration to succeed, logging all failures. *)
+  val all_results
+    :  name:string
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t
+    -> ((Merlin_config.configuration * 'a) list, Jsonrpc.Response.Error.t) result
+
   val source : t -> Msource.t
   val timer : t -> Lev_fiber.Timer.Wheel.task
+  val fixed_configuration : t -> Merlin_config.configuration option
+
+  val configuration_context
+    :  t
+    -> (configuration_context, Merlin_config.error) result Fiber.t
+
+  val configuration_context_exn : t -> configuration_context Fiber.t
 
   (** uses a single pipeline, provisioned by the configuration attached to the
       merlin document (via {!type:t}). *)
@@ -83,6 +112,13 @@ module Merlin : sig
     -> (Mpipeline.t -> 'a)
     -> 'a Fiber.t
 
+  val with_configurations
+    :  ?name:string
+    -> t
+    -> configurations:Merlin_config.configuration_set
+    -> (Merlin_config.configuration -> Mpipeline.t -> 'a)
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t Fiber.t
+
   val dispatch
     :  ?name:string
     -> t
@@ -91,12 +127,12 @@ module Merlin : sig
 
   val dispatch_exn : ?name:string -> t -> 'a Query_protocol.t -> 'a Fiber.t
 
-  val doc_comment
+  val dispatch_all
     :  ?name:string
     -> t
-    -> Msource.position
-    -> (* doc string *)
-    string option Fiber.t
+    -> configurations:Merlin_config.configuration_set
+    -> 'a Query_protocol.t
+    -> 'a configured_result Merlin_dot_protocol.Nonempty_list.t Fiber.t
 
   val syntax_doc
     :  Mpipeline.t
@@ -110,14 +146,6 @@ module Merlin : sig
     ; syntax_doc : Query_protocol.syntax_doc_result option
     }
 
-  val type_enclosing
-    :  ?name:string
-    -> t
-    -> Msource.position
-    -> (* verbosity *) int
-    -> with_syntax_doc:bool
-    -> type_enclosing option Fiber.t
-
   val kind : t -> Kind.t
   val to_doc : t -> doc
   val mconfig : t -> Mconfig.t Fiber.t
@@ -125,6 +153,7 @@ end
 
 val kind : t -> [ `Merlin of Merlin.t | `Other ]
 val merlin_exn : t -> Merlin.t
+val with_merlin_configuration : t -> Merlin_config.configuration -> t
 val version : t -> int
 val update_text : ?version:int -> t -> TextDocumentContentChangeEvent.t list -> t
 val close : t -> unit Fiber.t
@@ -135,3 +164,9 @@ val text_document : t -> Text_document.t
 
     For instance, the counterparts of the file [/file.ml] are [/file.mli]. *)
 val get_impl_intf_counterparts : Merlin.t option -> Uri.t -> Uri.t list
+
+val get_impl_intf_counterparts_for_configurations
+  :  Merlin.t
+  -> Merlin_config.configuration_set
+  -> Uri.t
+  -> Uri.t list

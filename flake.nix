@@ -7,7 +7,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     merlin = {
-      url = "github:ocaml/merlin";
+      url = "github:anmonteiro/merlin/anmonteiro/editor-mode-prototype";
       flake = false;
     };
   };

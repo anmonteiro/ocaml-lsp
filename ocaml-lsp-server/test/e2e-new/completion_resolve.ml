@@ -1,17 +1,44 @@
 open Test.Import
 
-let completion_item_resolve client label position =
-  let data =
-    `Assoc
-      [ "textDocument", `Assoc [ "uri", DocumentUri.yojson_of_t Helpers.uri ]
-      ; "position", Position.yojson_of_t position
-      ]
-  in
-  Client.request client (CompletionItemResolve (CompletionItem.create ~label ~data ()))
+let resolve_support =
+  ClientCompletionItemResolveOptions.create ~properties:[ "documentation" ]
 ;;
 
-let print_completion_item item =
-  CompletionItem.yojson_of_t item
+let capabilities =
+  let completionItem =
+    ClientCompletionItemOptions.create ~resolveSupport:resolve_support ()
+  in
+  let completion = CompletionClientCapabilities.create ~completionItem () in
+  let textDocument = TextDocumentClientCapabilities.create ~completion () in
+  ClientCapabilities.create ~textDocument ()
+;;
+
+let completion_item_resolve client label position =
+  let textDocument = TextDocumentIdentifier.create ~uri:Helpers.uri in
+  let params = CompletionParams.create ~textDocument ~position () in
+  let* completions = Client.request client (TextDocumentCompletion params) in
+  let items =
+    match completions with
+    | None -> failwith "missing completions"
+    | Some (`CompletionList { items; _ } | `List items) -> items
+  in
+  let item =
+    List.find_exn items ~f:(fun (item : CompletionItem.t) ->
+      String.equal item.label label)
+  in
+  let+ resolved = Client.request client (CompletionItemResolve item) in
+  if
+    not
+      (Poly.equal
+         { resolved with documentation = item.documentation; data = item.data }
+         item)
+  then failwith "completion resolve changed fields other than documentation and data";
+  resolved
+;;
+
+let print_completion_item (item : CompletionItem.t) =
+  CompletionItem.create ~label:item.label ?documentation:item.documentation ()
+  |> CompletionItem.yojson_of_t
   |> Yojson.Safe.pretty_to_string ~std:false
   |> print_endline
 ;;
@@ -28,7 +55,7 @@ let%expect_test "can get documentation for the end of document" =
     print_completion_item response;
     Fiber.return ()
   in
-  Helpers.test source req;
+  Helpers.test ~capabilities source req;
   [%expect
     {|
     {
@@ -67,8 +94,6 @@ let%expect_test "completion resolve after its document changes" =
       List.find_exn items ~f:(fun (item : CompletionItem.t) ->
         String.equal item.label "old_value")
     in
-    print_endline "Completion item before document update:";
-    print_completion_item item;
     let textDocument =
       VersionedTextDocumentIdentifier.create ~uri:Helpers.uri ~version:1
     in
@@ -84,47 +109,14 @@ let%expect_test "completion resolve after its document changes" =
         (TextDocumentDidChange
            (DidChangeTextDocumentParams.create ~textDocument ~contentChanges))
     in
-    let* item = Client.request client (CompletionItemResolve item) in
-    print_endline "Same item resolved after document update to version 1:";
-    print_completion_item item;
+    let* resolved = Client.request client (CompletionItemResolve item) in
+    Printf.printf "Stale completion item unchanged: %b\n" (Poly.equal item resolved);
     Fiber.return ()
   in
   Helpers.test ~capabilities source req;
   [%expect
     {|
-    Completion item before document update:
-    {
-      "data": {
-        "position": { "character": 12, "line": 2 },
-        "textDocument": { "uri": "file:///test.ml" }
-      },
-      "detail": "int",
-      "kind": 12,
-      "label": "old_value",
-      "sortText": "0000",
-      "textEdit": {
-        "newText": "old_value",
-        "range": {
-          "end": { "character": 12, "line": 2 },
-          "start": { "character": 8, "line": 2 }
-        }
-      }
-    }
-    Same item resolved after document update to version 1:
-    {
-      "detail": "int",
-      "documentation": "new docs",
-      "kind": 12,
-      "label": "old_value",
-      "sortText": "0000",
-      "textEdit": {
-        "newText": "old_value",
-        "range": {
-          "end": { "character": 12, "line": 2 },
-          "start": { "character": 8, "line": 2 }
-        }
-      }
-    }
+    Stale completion item unchanged: true
     |}]
 ;;
 
@@ -201,7 +193,7 @@ let%expect_test "can get documentation at arbitrary position" =
     print_completion_item response;
     Fiber.return ()
   in
-  Helpers.test source req;
+  Helpers.test ~capabilities source req;
   [%expect
     {|
     {
@@ -225,7 +217,7 @@ let _ = 1 >>. 2
     print_completion_item response;
     Fiber.return ()
   in
-  Helpers.test source req;
+  Helpers.test ~capabilities source req;
   [%expect {| { "documentation": "combine docs", "label": ">>." } |}]
 ;;
 
@@ -238,8 +230,14 @@ let%expect_test "completion resolve converts UTF-16 positions for Merlin" =
     print_completion_item response;
     Fiber.return ()
   in
-  Helpers.test source req;
-  [%expect {| { "label": "map2" } |}]
+  Helpers.test ~capabilities source req;
+  [%expect
+    {|
+    {
+      "documentation": "[map2 f [a1; ...; an] [b1; ...; bn]] is\n   [[f a1 b1; ...; f an bn]].\n   @raise Invalid_argument if the two lists are determined\n   to have different lengths.",
+      "label": "map2"
+    }
+    |}]
 ;;
 
 let%expect_test "can get documentation at arbitrary position (before dot)" =
@@ -263,13 +261,18 @@ Outer.Inner.v
     print_completion_item response;
     Fiber.return ()
   in
-  Helpers.test source req;
+  Helpers.test ~capabilities source req;
   [%expect {| { "documentation": "documentation for [Inner]", "label": "Inner" } |}]
 ;;
 
 let%expect_test "can get markdown documentation when the client prefers it" =
   let documentationFormat = [ MarkupKind.Markdown ] in
-  let completionItem = ClientCompletionItemOptions.create ~documentationFormat () in
+  let completionItem =
+    ClientCompletionItemOptions.create
+      ~documentationFormat
+      ~resolveSupport:resolve_support
+      ()
+  in
   let completion = CompletionClientCapabilities.create ~completionItem () in
   let textDocument = TextDocumentClientCapabilities.create ~completion () in
   let capabilities = ClientCapabilities.create ~textDocument () in
