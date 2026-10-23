@@ -1,0 +1,3 @@
+(executable
+ (name fake_ocaml_merlin)
+ (libraries csexp unix))

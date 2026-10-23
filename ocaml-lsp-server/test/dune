@@ -15,7 +15,10 @@
   lev_fiber
   ordering
   ocaml_lsp_server
+  merlin-lib.dot_protocol
   merlin-lib.kernel
+  jsonrpc
+  stdune
   lsp
   yojson
   ;; This is because of the (implicit_transitive_deps false)
