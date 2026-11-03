@@ -21,11 +21,11 @@
     "merlin": {
       "flake": false,
       "locked": {
-        "lastModified": 1792737241,
-        "narHash": "sha256-s/p+mK3drP9HGdKyFVNJvK07QLPQ9d1DzDx70a7+/Gs=",
+        "lastModified": 1793679704,
+        "narHash": "sha256-S4FH44D2CmIQWq1qxuj3WEgDmUAmR+v4ljxFOxJMNNU=",
         "owner": "anmonteiro",
         "repo": "merlin",
-        "rev": "c487e0c945f040280f455f634c2f6aec350f4269",
+        "rev": "4ee1d158a2fecd98be1d88b4e99088daa4364f7d",
         "type": "github"
       },
       "original": {
