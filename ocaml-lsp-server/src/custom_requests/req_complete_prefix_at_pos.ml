@@ -77,11 +77,12 @@ let on_request ~(params : Jsonrpc.Structured.t option) (state : State.t) =
     let Request_params.{ text_document = { uri }; position; prefix } =
       Request_params.of_jsonrpc_params_exn params
     in
-    let doc = Document_store.get state.store uri in
-    match Document.kind doc with
-    | `Other -> Fiber.return (`Assoc [ "entries", `Null ])
-    | `Merlin merlin ->
-      Compl.Complete_by_prefix.complete_nosquash merlin ~prefix position >>| serialize)
+    Util.with_primary_merlin
+      state
+      uri
+      ~default:(`Assoc [ "entries", `Null ])
+      (fun merlin ->
+         Compl.Complete_by_prefix.complete_nosquash merlin ~prefix position >>| serialize))
 ;;
 
 module For_testing = struct

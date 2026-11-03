@@ -162,6 +162,37 @@ let%expect_test "old Dune falls back only on the exact unsupported response" =
   [%expect {| [ { "mode": null, "isDefault": true } ] |}]
 ;;
 
+let%expect_test "completePrefixAtPos selects the default configuration" =
+  let module Req = Ocaml_lsp_server.Custom_request.Complete_prefix_at_pos in
+  let source = "let MODE_NAME = MODE_EXPR\nlet value = " in
+  let run protocol =
+    Helpers.test ~extra_env:(extra_env protocol) source (fun client ->
+      let text_document = TextDocumentIdentifier.create ~uri:Helpers.uri in
+      let position = Position.create ~line:1 ~character:12 in
+      let params =
+        Req.Request_params.create ~text_document ~position ~prefix:"ocaml"
+        |> Req.Request_params.yojson_of_t
+      in
+      let+ response = Test.custom_request client Req.meth params in
+      let open Yojson.Safe.Util in
+      response
+      |> member "entries"
+      |> to_list
+      |> List.iter ~f:(fun item ->
+        Printf.printf
+          "%s: %s\n"
+          (item |> member "label" |> to_string)
+          (item |> member "detail" |> to_string)))
+  in
+  run "preprocessed";
+  run "reversed-preprocessed";
+  [%expect
+    {|
+    ocamlOnly: int
+    ocamlOnly: int
+    |}]
+;;
+
 let%expect_test "invalid plural responses do not synthesize a default" =
   let run protocol =
     Helpers.test ~extra_env:(extra_env protocol) source (fun client ->
