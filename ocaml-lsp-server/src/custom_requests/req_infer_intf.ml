@@ -20,10 +20,18 @@ let on_request ~(params : Jsonrpc.Structured.t option) (state : State.t) =
               ())
        | Some impl ->
          (match Document.kind impl with
-          | `Merlin merlin when Document.Merlin.kind merlin = Document.Kind.Impl ->
-            let+ intf = Inference.infer_intf_for_impl impl in
-            Json.t_of_yojson (`String intf)
-          | `Merlin _ | `Other ->
+          | `Merlin merlin ->
+            let* merlin = Util.singleton_merlin merlin in
+            (match Document.Merlin.kind merlin with
+             | Document.Kind.Impl ->
+               let impl = Document.Merlin.to_doc merlin in
+               let+ intf = Inference.infer_intf_for_impl impl in
+               Json.t_of_yojson (`String intf)
+             | Intf ->
+               Util.raise_invalid_params
+                 ~message:"ocamllsp/inferIntf expects an implementation document"
+                 ())
+          | `Other ->
             Util.raise_invalid_params
               ~message:"ocamllsp/inferIntf expects an implementation document"
               ()))

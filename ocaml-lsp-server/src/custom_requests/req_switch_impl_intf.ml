@@ -1,12 +1,21 @@
 open Import
+open Fiber.O
 
 let capability = "handleSwitchImplIntf", `Bool true
 let meth = "ocamllsp/switchImplIntf"
 
 (** see the spec for [ocamllsp/switchImplIntf] *)
-let switch merlin_doc (param : DocumentUri.t) : Json.t =
-  let files_to_switch_to = Document.get_impl_intf_counterparts merlin_doc param in
-  Json.yojson_of_list Uri.yojson_of_t files_to_switch_to
+let switch merlin_doc (param : DocumentUri.t) =
+  let* files_to_switch_to =
+    match merlin_doc with
+    | None -> Fiber.return (Document.get_impl_intf_counterparts None param)
+    | Some merlin ->
+      let+ { Document.Merlin.configurations; _ } =
+        Document.Merlin.configuration_context_exn merlin
+      in
+      Document.get_impl_intf_counterparts_for_configurations merlin configurations param
+  in
+  Fiber.return (Json.yojson_of_list Uri.yojson_of_t files_to_switch_to)
 ;;
 
 let on_request ~(params : Jsonrpc.Structured.t option) (state : State.t) =

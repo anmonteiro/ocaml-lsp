@@ -202,5 +202,5 @@ let on_request ~params state =
     let params = (Option.value ~default:(`Assoc []) params :> Json.t) in
     let Request_params.{ text_document; position } = Request_params.t_of_yojson params in
     let uri = text_document.uri in
-    Util.with_pipeline state uri ~default:`Null @@ dispatch_locate_types position)
+    Util.with_primary_pipeline state uri ~default:`Null @@ dispatch_locate_types position)
 ;;

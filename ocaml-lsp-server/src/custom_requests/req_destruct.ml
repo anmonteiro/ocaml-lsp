@@ -64,5 +64,5 @@ let on_request ~params state =
     let params = (Option.value ~default:(`Assoc []) params :> Json.t) in
     let Request_params.{ text_document; range } = Request_params.t_of_yojson params in
     let uri = text_document.uri in
-    Util.with_impl_pipeline state uri ~default:`Null @@ dispatch_destruct range)
+    Util.with_singleton_impl_pipeline state uri ~default:`Null @@ dispatch_destruct range)
 ;;

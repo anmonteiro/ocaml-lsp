@@ -324,16 +324,35 @@ let compute (state : State.t) (params : FoldingRangeParams.t) =
     | `Other -> Fiber.return None
     | `Merlin m ->
       let config = client_config state in
-      let+ ranges =
-        Document.Merlin.with_pipeline_exn ~name:"folding range" m (fun pipeline ->
-          let parsetree = Mpipeline.reader_parsetree pipeline in
-          fold_over_parsetree config parsetree)
+      let* { Document.Merlin.configurations; _ } =
+        Document.Merlin.configuration_context_exn m
+      in
+      let+ configured =
+        Document.Merlin.with_configurations
+          ~name:"folding range"
+          m
+          ~configurations
+          (fun _ pipeline ->
+             let parsetree = Mpipeline.reader_parsetree pipeline in
+             fold_over_parsetree config parsetree)
+      in
+      let range_sets =
+        Document.Merlin.successful_results ~name:"folding range" configured
+        |> List.map ~f:snd
+      in
+      let ranges =
+        List.fold_left range_sets ~init:[] ~f:(fun accumulated ranges ->
+          let unseen =
+            List.filter ranges ~f:(fun range ->
+              not (List.exists accumulated ~f:(Poly.equal range)))
+          in
+          accumulated @ unseen)
       in
       let ranges =
         (* [rangeLimit] is a hint, so returning fewer ranges is allowed. *)
         match config.range_limit with
-        | Some limit when limit < List.length ranges -> List.take ranges limit
-        | Some _ | None -> ranges
+        | None -> ranges
+        | Some range_limit -> List.take ranges (Int.max range_limit 0)
       in
       Some ranges)
 ;;

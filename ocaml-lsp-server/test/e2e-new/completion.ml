@@ -133,8 +133,7 @@ let snippet_capabilities =
   ClientCapabilities.create ~textDocument ()
 ;;
 
-(* CR: Keep these known position bugs until the coordinated encoding fixes. *)
-let%expect_test "CR: completion queries use byte columns for UTF-16 positions" =
+let%expect_test "completion edits use UTF-16 positions after Unicode" =
   let source = "let café = List.ma" in
   let position = Position.create ~line:0 ~character:18 in
   let only_map =
@@ -153,7 +152,7 @@ let%expect_test "CR: completion queries use byte columns for UTF-16 positions" =
         "newText": "map",
         "range": {
           "end": { "character": 18, "line": 0 },
-          "start": { "character": 17, "line": 0 }
+          "start": { "character": 16, "line": 0 }
         }
       }
     }

@@ -16,9 +16,13 @@ let compute (state : State.t) { InlayHintParams.range; textDocument = { uri }; _
   in
   match Document.kind doc with
   | `Other -> Fiber.return None
-  | `Merlin m when Document.Merlin.kind m = Intf -> Fiber.return None
   | `Merlin doc ->
-    let+ hints =
+    let* { Document.Merlin.configurations; kind } =
+      Document.Merlin.configuration_context_exn doc
+    in
+    if kind = Intf
+    then Fiber.return None
+    else (
       let hint_let_bindings =
         Option.map state.configuration.data.inlay_hints ~f:(fun c -> c.hint_let_bindings)
         |> Option.value ~default:false
@@ -33,34 +37,84 @@ let compute (state : State.t) { InlayHintParams.range; textDocument = { uri }; _
           c.hint_function_params)
         |> Option.value ~default:false
       in
-      Document.Merlin.with_pipeline_exn ~name:"inlay-hints" doc (fun pipeline ->
-        let start = range.start |> Position.logical
-        and stop = range.end_ |> Position.logical in
-        let command =
-          Query_protocol.Inlay_hints
-            ( start
-            , stop
-            , hint_let_bindings
-            , hint_pattern_variables
-            , hint_function_params
-            , not inside_test )
-        in
-        let hints = Query_commands.dispatch pipeline command in
-        List.filter_map
-          ~f:(fun (pos, label) ->
-            let open Option.O in
-            let+ position = Position.of_lexical_position pos in
-            let label = `String (outline_type label) in
-            InlayHint.create
-              ~kind:Type
-              ~position
-              ~label
-              ~paddingLeft:false
-              ~paddingRight:false
-              ())
-          hints
+      let+ configured =
+        Document.Merlin.with_configurations
+          ~name:"inlay-hints"
+          doc
+          ~configurations
+          (fun _ pipeline ->
+             let start = range.start |> Position.logical
+             and stop = range.end_ |> Position.logical in
+             let command =
+               Query_protocol.Inlay_hints
+                 ( start
+                 , stop
+                 , hint_let_bindings
+                 , hint_pattern_variables
+                 , hint_function_params
+                 , not inside_test )
+             in
+             let hints = Query_commands.dispatch pipeline command in
+             List.filter_map
+               ~f:(fun (pos, label) ->
+                 let open Option.O in
+                 let+ position = Position.of_lexical_position pos in
+                 position, outline_type label)
+               hints)
+      in
+      let hints =
+        Document.Merlin.successful_results ~name:"inlay hints" configured
+        |> List.concat_map ~f:(fun (configuration, hints) ->
+          List.map hints ~f:(fun hint -> configuration, hint))
+      in
+      let rec add configuration hint = function
+        | [] -> [ hint, [ configuration ] ]
+        | (candidate, contributors) :: rest ->
+          if Poly.equal candidate hint
+          then (
+            let contributors =
+              if
+                List.exists contributors ~f:(fun contributor ->
+                  contributor == configuration)
+              then contributors
+              else configuration :: contributors
+            in
+            (candidate, contributors) :: rest)
+          else (candidate, contributors) :: add configuration hint rest
+      in
+      let groups =
+        List.fold_left hints ~init:[] ~f:(fun groups (configuration, hint) ->
+          add configuration hint groups)
+      in
+      let all_configurations = Merlin_config.configuration_list configurations in
+      let hints =
+        List.map groups ~f:(fun ((position, text), contributors) ->
+          let universal = List.length contributors = List.length all_configurations in
+          let label =
+            if universal
+            then `String text
+            else (
+              let labels =
+                List.filter all_configurations ~f:(fun configuration ->
+                  List.exists contributors ~f:(fun contributor ->
+                    contributor == configuration))
+                |> List.map ~f:Merlin_config.configuration_label
+                |> String.concat ~sep:", "
+              in
+              `List
+                [ Lsp.Types.InlayHintLabelPart.create ~value:text ()
+                ; Lsp.Types.InlayHintLabelPart.create ~value:(" (" ^ labels ^ ")") ()
+                ])
+          in
+          InlayHint.create
+            ~kind:Type
+            ~position
+            ~label
+            ~paddingLeft:false
+            ~paddingRight:false
+            ())
         |> List.filter ~f:(fun (hint : InlayHint.t) ->
-          Lsp.Range.contains_position range hint.position ~inclusive_end:true))
-    in
-    Some hints
+          Lsp.Range.contains_position range hint.position ~inclusive_end:true)
+      in
+      Some hints)
 ;;

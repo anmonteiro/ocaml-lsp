@@ -44,6 +44,7 @@ module Process = struct
     ; stdin : Lev_fiber.Io.output Lev_fiber.Io.t
     ; stdout : Lev_fiber.Io.input Lev_fiber.Io.t
     ; session : Lev_fiber_csexp.Session.t
+    ; query_mutex : Fiber.Mutex.t
     ; mutable exited : bool
     ; mutable shutdown_timer : Lev_fiber.Timer.Wheel.task option
     }
@@ -164,6 +165,7 @@ module Process = struct
         ; stdin
         ; stdout
         ; session
+        ; query_mutex = Fiber.Mutex.create ()
         ; exited = false
         ; shutdown_timer = None
         }
@@ -198,12 +200,69 @@ module Dot_protocol_io =
       let write t x = write t [ x ]
     end)
 
+type _ process_request =
+  | Halt : unit process_request
+  | File :
+      string
+      -> (Merlin_dot_protocol.directive list, Merlin_dot_protocol.read_error) result
+           process_request
+  | File_configurations :
+      string
+      -> ( Merlin_dot_protocol.configuration Merlin_dot_protocol.Nonempty_list.t
+           , Merlin_dot_protocol.configurations_error )
+           result
+           process_request
+
+let process_request_path : type response. response process_request -> string = function
+  | Halt -> "<halt>"
+  | File path | File_configurations path -> path
+;;
+
+let execute_process_request (type response) session (request : response process_request)
+  : response Fiber.t
+  =
+  match request with
+  | Halt -> Dot_protocol_io.Commands.halt session
+  | File path ->
+    let* () = Dot_protocol_io.Commands.send_file session path in
+    Dot_protocol_io.read session
+  | File_configurations path ->
+    let* request = Dot_protocol_io.Commands.send_file_configurations session path in
+    Dot_protocol_io.read_configurations ~request session
+;;
+
+let process_query
+      (type response)
+      (process : Process.t)
+      (request : response process_request)
+  : response Fiber.t
+  =
+  let { Process.query_mutex; trace; command; pid; session; _ } = process in
+  let path = process_request_path request in
+  Fiber.Mutex.with_lock query_mutex ~f:(fun () ->
+    let* () =
+      trace
+        ~message:(fun () -> "Merlin configuration request sent")
+        ~verbose:(fun () ->
+          sprintf "Command: %s; pid: %d; file: %s" command (Pid.to_int pid) path)
+    in
+    let* response = execute_process_request session request in
+    let+ () =
+      trace
+        ~message:(fun () -> "Merlin configuration response received")
+        ~verbose:(fun () ->
+          sprintf "Command: %s; pid: %d; file: %s" command (Pid.to_int pid) path)
+    in
+    response)
+;;
+
 let prefer_dot_merlin = ref false
 
 type db =
   { running : (string, entry) Hashtbl.t
   ; pool : Fiber.Pool.t
   ; trace : trace
+  ; process_mutex : Fiber.Mutex.t
   }
 
 and entry =
@@ -236,7 +295,7 @@ module Entry = struct
               (Pid.to_int t.process.pid)
               t.process.initial_cwd)
       in
-      let+ () = Dot_protocol_io.Commands.halt t.process.session in
+      let+ () = process_query t.process Halt in
       (* Do not leave a process that handled [Halt] blocked waiting for more input. *)
       Lev_fiber.Io.close t.process.stdin)
   ;;
@@ -249,17 +308,18 @@ module Entry = struct
 end
 
 let get_process t ~dir =
-  match Hashtbl.find t.running dir with
-  | Some p -> Fiber.return (Ok p)
-  | None ->
-    let* process = Process.start ~trace:t.trace ~dir in
-    (match process with
-     | Error _ as error -> Fiber.return error
-     | Ok process ->
-       let entry = Entry.create t process in
-       Hashtbl.add_exn t.running ~key:dir ~data:entry;
-       let+ () = Fiber.Pool.task t.pool ~f:(fun () -> Process.waitpid process) in
-       Ok entry)
+  Fiber.Mutex.with_lock t.process_mutex ~f:(fun () ->
+    match Hashtbl.find t.running dir with
+    | Some p -> Fiber.return (Ok p)
+    | None ->
+      let* process = Process.start ~trace:t.trace ~dir in
+      (match process with
+       | Error _ as error -> Fiber.return error
+       | Ok process ->
+         let entry = Entry.create t process in
+         Hashtbl.add_exn t.running ~key:dir ~data:entry;
+         let+ () = Fiber.Pool.task t.pool ~f:(fun () -> Process.waitpid process) in
+         Ok entry))
 ;;
 
 type context =
@@ -267,34 +327,104 @@ type context =
   ; process_dir : string
   }
 
-let get_config (p : Process.t) ~workdir path_abs =
-  let query path (p : Process.t) =
-    let* () =
-      p.trace
-        ~message:(fun () -> "Merlin configuration request sent")
-        ~verbose:(fun () ->
-          sprintf "Command: %s; pid: %d; file: %s" p.command (Pid.to_int p.pid) path)
-    in
-    let* () = Dot_protocol_io.Commands.send_file p.session path in
-    let* response = Dot_protocol_io.read p.session in
-    let+ () =
-      p.trace
-        ~message:(fun () -> "Merlin configuration response received")
-        ~verbose:(fun () ->
-          let status =
-            match response with
-            | Ok directives -> sprintf "success; directives: %d" (List.length directives)
-            | Error _ -> "error"
-          in
-          sprintf
-            "Command: %s; pid: %d; file: %s; status: %s"
-            p.command
-            (Pid.to_int p.pid)
-            path
-            status)
-    in
-    response
-  in
+type mode =
+  | Ocaml
+  | Melange
+  | Other of string
+
+let mode_of_string = function
+  | "ocaml" -> Ocaml
+  | "melange" -> Melange
+  | mode -> Other mode
+;;
+
+let mode_key = function
+  | Ocaml -> "ocaml"
+  | Melange -> "melange"
+  | Other mode -> mode
+;;
+
+let mode_label = function
+  | Ocaml -> "OCaml"
+  | Melange -> "Melange"
+  | Other mode -> mode
+;;
+
+type source_kind =
+  | Implementation
+  | Interface
+
+type configuration_origin =
+  | Plural of
+      { mode : mode
+      ; kind : source_kind
+      ; counterpart : Uri.t option
+      }
+  | Legacy_file
+
+type configuration =
+  { origin : configuration_origin
+  ; is_default : bool
+  ; config : Mconfig.t
+  }
+
+type configuration_set = configuration Merlin_dot_protocol.Nonempty_list.t
+type error = string list
+
+let configuration_mode (configuration : configuration) =
+  match configuration.origin with
+  | Legacy_file -> None
+  | Plural { mode; _ } -> Some mode
+;;
+
+let configuration_label configuration =
+  configuration_mode configuration |> Option.value_map ~default:"legacy" ~f:mode_label
+;;
+
+let nonempty_to_list = Merlin_dot_protocol.Nonempty_list.to_list
+
+let configuration_list (configurations : configuration_set) =
+  nonempty_to_list configurations
+;;
+
+let singleton configuration = Merlin_dot_protocol.Nonempty_list.create configuration []
+
+let map_nonempty configurations ~f =
+  match nonempty_to_list configurations with
+  | first :: rest -> Merlin_dot_protocol.Nonempty_list.create (f first) (List.map rest ~f)
+  | [] -> invalid_arg "Merlin_config.map_nonempty"
+;;
+
+let primary (configurations : configuration_set) =
+  configuration_list configurations
+  |> List.find ~f:(fun (configuration : configuration) -> configuration.is_default)
+  |> Option.value ~default:(List.hd_exn (configuration_list configurations))
+;;
+
+let find_mode (configurations : configuration_set) mode =
+  configuration_list configurations
+  |> List.find ~f:(fun (configuration : configuration) ->
+    match configuration.origin with
+    | Legacy_file -> false
+    | Plural origin -> String.equal (mode_key origin.mode) (mode_key mode))
+;;
+
+let legacy_configuration config =
+  Merlin_dot_protocol.Nonempty_list.create
+    { origin = Legacy_file; is_default = true; config }
+    []
+;;
+
+let protocol_error_message p = function
+  | Merlin_dot_protocol.Unexpected_output msg -> msg
+  | Csexp_parse_error _ ->
+    Printf.sprintf
+      "ocamllsp could not load its configuration from the external reader. Building your \
+       project with `%s` might solve this issue."
+      p.Process.prog
+;;
+
+let relative_query_path (p : Process.t) path_abs =
   (* Both [p.initial_cwd] and [path_abs] have gone through
      [canonicalize_filename] *)
   let path_rel =
@@ -307,18 +437,20 @@ let get_config (p : Process.t) ~workdir path_abs =
       then String.drop_prefix path 1
       else path)
   in
-  let path =
-    match path_rel with
-    | Some path_rel -> path_rel
-    | _ -> path_abs
-  in
+  Option.value path_rel ~default:path_abs
+;;
+
+let query_file (p : Process.t) path = process_query p (File path)
+
+let get_legacy_config (p : Process.t) ~workdir path_abs =
+  let path = relative_query_path p path_abs in
   (* Starting with Dune 2.8.3 relative paths are prefered. However to maintain
      compatibility with 2.8 <= Dune <= 2.8.2 we always retry with an absolute
      path if using a relative one failed *)
   let+ answer =
-    let* query_path = query path p in
+    let* query_path = query_file p path in
     match query_path with
-    | Ok [ `ERROR_MSG _ ] -> query path_abs p
+    | Ok [ `ERROR_MSG _ ] when not (String.equal path path_abs) -> query_file p path_abs
     | answer -> Fiber.return answer
   in
   match answer with
@@ -330,16 +462,52 @@ let get_config (p : Process.t) ~workdir path_abs =
         directives
         empty
     in
-    Mconfig_dot.postprocess_config cfg, failures
-  | Error (Merlin_dot_protocol.Unexpected_output msg) -> empty, [ msg ]
-  | Error (Csexp_parse_error _) ->
-    let suggest =
-      Printf.sprintf
-        "ocamllsp could not load its configuration from the external reader. Building \
-         your project with `%s` might solve this issue."
-        p.prog
-    in
-    empty, [ suggest ]
+    Ok (Mconfig_dot.postprocess_config cfg, failures)
+  | Error error -> Error [ protocol_error_message p error ]
+;;
+
+let canonical_uri path = Source_path.of_path path
+
+let get_configurations (p : Process.t) ~workdir path_abs =
+  let path = relative_query_path p path_abs in
+  let query_plural () = process_query p (File_configurations path) in
+  let legacy () =
+    let+ result = get_legacy_config p ~workdir path_abs in
+    Result.map result ~f:(fun (dot, failures) -> `Legacy (dot, failures))
+  in
+  let+ response =
+    let* response = query_plural () in
+    match response with
+    | Error Merlin_dot_protocol.Unsupported -> legacy ()
+    | Error (Server_error message) -> Fiber.return (Error [ message ])
+    | Error (Protocol_error error) ->
+      Fiber.return (Error [ protocol_error_message p error ])
+    | Ok configurations -> Fiber.return (Ok (`Plural configurations))
+  in
+  Result.map response ~f:(function
+    | `Legacy (dot, failures) -> `Legacy (dot, failures)
+    | `Plural configurations ->
+      let make configuration =
+        let directives = Merlin_dot_protocol.configuration_directives configuration in
+        let cfg, failures =
+          Mconfig_dot.prepend_config
+            ~dir:workdir
+            Mconfig_dot.Configurator.Dune
+            directives
+            empty
+        in
+        let kind =
+          match configuration.kind with
+          | Merlin_dot_protocol.Implementation -> Implementation
+          | Interface -> Interface
+        in
+        let counterpart = Option.map configuration.counterpart ~f:canonical_uri in
+        ( Plural { mode = mode_of_string configuration.mode; kind; counterpart }
+        , configuration.is_default
+        , Mconfig_dot.postprocess_config cfg
+        , failures )
+      in
+      `Plural (map_nonempty configurations ~f:make))
 ;;
 
 let file_exists fname =
@@ -401,9 +569,10 @@ type nonrec t =
   ; initial : Mconfig.t
   ; mutable entry : Entry.t option
   ; db : db
+  ; mutex : Fiber.Mutex.t
   }
 
-let destroy t =
+let destroy_unlocked t =
   let* () = Fiber.return () in
   match t.entry with
   | None -> Fiber.return ()
@@ -412,10 +581,12 @@ let destroy t =
     Entry.destroy entry
 ;;
 
+let destroy t = Fiber.Mutex.with_lock t.mutex ~f:(fun () -> destroy_unlocked t)
+
 let create db path =
   let path =
     let path = Uri.to_path path in
-    Misc.canonicalize_filename path
+    Source_path.canonicalize path
   in
   let directory = Filename.dirname path in
   let initial =
@@ -425,48 +596,80 @@ let create db path =
       query = { init.query with filename; directory; verbosity = Mconfig.Verbosity.Smart }
     }
   in
-  { path; directory; initial; db; entry = None }
+  { path; directory; initial; db; entry = None; mutex = Fiber.Mutex.create () }
 ;;
 
-let config (t : t) : Mconfig.t Fiber.t =
+let load_configurations (t : t) : (configuration_set, error) result Fiber.t =
   let use_entry entry =
     Entry.incr entry;
     t.entry <- Some entry
   in
   let* () = Fiber.return () in
   if !prefer_dot_merlin
-  then Fiber.return (Mconfig.get_external_config t.path t.initial)
+  then
+    Mconfig.get_external_config t.path t.initial
+    |> legacy_configuration
+    |> Result.return
+    |> Fiber.return
   else (
     match find_project_context t.directory with
     | None ->
-      let+ () = destroy t in
-      Mconfig.get_external_config t.path t.initial
+      let+ () = destroy_unlocked t in
+      Result.return (legacy_configuration (Mconfig.get_external_config t.path t.initial))
     | Some (ctx, config_path) ->
-      let* dot, failures =
-        let* entry = get_process t.db ~dir:ctx.process_dir in
-        match entry with
-        | Error failure ->
-          let+ () = destroy t in
-          empty, [ failure ]
-        | Ok entry ->
-          let* () =
-            match t.entry with
-            | None ->
-              use_entry entry;
-              Fiber.return ()
-            | Some entry' ->
-              if Entry.equal entry entry'
-              then Fiber.return ()
-              else
-                let+ () = destroy t in
-                use_entry entry
-          in
-          get_config entry.process ~workdir:ctx.workdir t.path
-      in
-      let merlin =
-        Mconfig.merge_merlin_config dot t.initial.merlin ~failures ~config_path
-      in
-      Fiber.return (Mconfig.normalize { t.initial with merlin }))
+      let* entry = get_process t.db ~dir:ctx.process_dir in
+      (match entry with
+       | Error failure ->
+         let+ () = destroy_unlocked t in
+         Error [ failure ]
+       | Ok entry ->
+         let* () =
+           match t.entry with
+           | None ->
+             use_entry entry;
+             Fiber.return ()
+           | Some entry' ->
+             if Entry.equal entry entry'
+             then Fiber.return ()
+             else
+               let+ () = destroy_unlocked t in
+               use_entry entry
+         in
+         let+ loaded = get_configurations entry.process ~workdir:ctx.workdir t.path in
+         Result.map loaded ~f:(fun loaded ->
+           let merge dot failures =
+             let merlin =
+               Mconfig.merge_merlin_config dot t.initial.merlin ~failures ~config_path
+             in
+             Mconfig.normalize { t.initial with merlin }
+           in
+           match loaded with
+           | `Legacy (dot, failures) -> legacy_configuration (merge dot failures)
+           | `Plural loaded ->
+             let make (origin, is_default, dot, failures) =
+               { origin; is_default; config = merge dot failures }
+             in
+             map_nonempty loaded ~f:make)))
+;;
+
+let configurations t = Fiber.Mutex.with_lock t.mutex ~f:(fun () -> load_configurations t)
+
+let config_with_failures t failures =
+  let merlin =
+    Mconfig.merge_merlin_config
+      empty
+      t.initial.merlin
+      ~failures
+      ~config_path:"<merlin-config>"
+  in
+  Mconfig.normalize { t.initial with merlin }
+;;
+
+let config (t : t) : Mconfig.t Fiber.t =
+  let+ configurations = configurations t in
+  match configurations with
+  | Ok configurations -> (primary configurations).config
+  | Error failures -> config_with_failures t failures
 ;;
 
 module DB = struct
@@ -475,7 +678,11 @@ module DB = struct
   let get t uri = create t uri
 
   let create ~trace =
-    { running = Hashtbl.create (module String); pool = Fiber.Pool.create (); trace }
+    { running = Hashtbl.create (module String)
+    ; pool = Fiber.Pool.create ()
+    ; trace
+    ; process_mutex = Fiber.Mutex.create ()
+    }
   ;;
 
   let run t = Fiber.Pool.run t.pool
